@@ -1,0 +1,39 @@
+/**
+ * Fallback for missing coreTypes.generated.js
+ */
+
+export type SDKMessage = any;
+export type SDKResultMessage = any;
+export type SDKSessionInfo = any;
+export type SDKUserMessage = any;
+export type SDKResultSuccess = any;
+export type SDKResultFailure = any;
+export type SDKResult = any;
+export type SDKSessionMetadata = any;
+export type SDKSessionSummary = any;
+export type SDKSessionStatus = any;
+export type SDKSessionExitReason = any;
+export type SDKSessionStopReason = any;
+export type SDKSessionEvent = any;
+export type SDKSessionHookEvent = any;
+export type SDKSessionPermissionRequest = any;
+export type SDKSessionPermissionResponse = any;
+export type SDKSessionNotification = any;
+export type SDKSessionElicitation = any;
+export type SDKSessionElicitationResult = any;
+export type SDKSessionTaskCreated = any;
+export type SDKSessionTaskCompleted = any;
+export type SDKSessionConfigChange = any;
+export type SDKSessionCwdChanged = any;
+export type SDKSessionFileChanged = any;
+export type SDKSessionWorktreeCreate = any;
+export type SDKSessionWorktreeRemove = any;
+export type SDKSessionInstructionsLoaded = any;
+export type SDKSessionTeammateIdle = any;
+export type SDKSessionSubagentStart = any;
+export type SDKSessionSubagentStop = any;
+export type SDKSessionPreCompact = any;
+export type SDKSessionPostCompact = any;
+export type SDKSessionPreToolUse = any;
+export type SDKSessionPostToolUse = any;
+export type SDKSessionPostToolUseFailure = any;

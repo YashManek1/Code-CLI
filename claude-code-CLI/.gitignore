@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.DS_Store
+build.log
+server.json
+package-lock.json
+bun.lock

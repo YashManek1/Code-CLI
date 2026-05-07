@@ -1,0 +1,27 @@
+=== Debug Proxy started at 2026-05-05T13:26:11.006Z ===
+[2026-05-05T13:26:15.760Z] 
+--- INCOMING REQUEST ---
+[2026-05-05T13:26:15.763Z] METHOD: HEAD
+[2026-05-05T13:26:15.764Z] PATH:   /
+[2026-05-05T13:26:15.766Z] HEADERS: {
+  "connection": "keep-alive",
+  "user-agent": "Bun/1.3.13",
+  "accept": "*/*",
+  "host": "127.0.0.1:8082",
+  "accept-encoding": "gzip, deflate, br, zstd"
+}
+[2026-05-05T13:26:15.767Z] RESPONSE: 200 health check
+[2026-05-05T13:26:21.993Z] 
+--- INCOMING REQUEST ---
+[2026-05-05T13:26:21.995Z] METHOD: GET
+[2026-05-05T13:26:21.996Z] PATH:   /api/bootstrap
+[2026-05-05T13:26:21.997Z] HEADERS: {
+  "accept": "application/json, text/plain, */*",
+  "accept-encoding": "gzip, compress, deflate, br",
+  "content-type": "application/json",
+  "user-agent": "claude-code/9.9.9",
+  "x-api-key": "ccnim",
+  "connection": "keep-alive",
+  "host": "127.0.0.1:8082"
+}
+[2026-05-05T13:26:21.998Z] RESPONSE: 200 bootstrap mock

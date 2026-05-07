@@ -1,0 +1,38 @@
+{
+  "name": "warrioraashuu-codemaster",
+  "version": "1.1.0",
+  "mcpName": "io.github.warrioraashuu/warrioraashuu-codemaster",
+  "description": "MCP server for exploring the Claude Code source code — rebranded and published by warrioraashuu. STDIO, HTTP, and SSE transports.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/codeaashu/claude-code.git"
+  },
+  "author": "warrioraashuu <npmjs.com/~warrioraashuu>",
+  "homepage": "https://github.com/codeaashu/claude-code#readme",
+  "bugs": {
+    "url": "https://github.com/codeaashu/claude-code/issues"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "warrioraashuu-codemaster": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "start:http": "node dist/http.js",
+    "dev": "npx tsx src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
+
+
