@@ -162,13 +162,26 @@ def _build_models_list_response(
 # =============================================================================
 # Routes
 # =============================================================================
+_FORWARDED_HEADER_NAMES = frozenset(
+    {
+        "anthropic-beta",
+        "anthropic-version",
+    }
+)
+
 @router.post("/v1/messages")
 async def create_message(
+    request: Request,
     request_data: MessagesRequest,
     service: ClaudeProxyService = Depends(get_proxy_service),
     _auth=Depends(require_api_key),
 ):
     """Create a message (always streaming)."""
+    forwarded = {
+        k: v for k, v in request.headers.items() if k.lower() in _FORWARDED_HEADER_NAMES
+    }
+    if forwarded:
+        request_data.forwarded_headers = forwarded
     return service.create_message(request_data)
 
 

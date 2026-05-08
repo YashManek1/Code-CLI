@@ -410,6 +410,46 @@ export function sessionIdExists(sessionId: string): boolean {
   }
 }
 
+async function findSessionFileById(sessionId: UUID): Promise<string | null> {
+  const currentProjectFile = join(
+    getSessionProjectDir() ?? getProjectDir(getOriginalCwd()),
+    `${sessionId}.jsonl`,
+  )
+  try {
+    await stat(currentProjectFile)
+    return currentProjectFile
+  } catch {
+    // Fall through to a cross-project lookup. A UUID is globally specific
+    // enough that this is safe, and it makes `claude --resume <id>` work even
+    // when the user launches from a different cwd than the original session.
+  }
+
+  let dirents: Dirent[]
+  try {
+    dirents = await readdir(getProjectsDir(), { withFileTypes: true })
+  } catch {
+    return null
+  }
+
+  const filename = `${sessionId}.jsonl`
+  const candidates = dirents
+    .filter(dirent => dirent.isDirectory())
+    .map(dirent => join(getProjectsDir(), dirent.name, filename))
+
+  const results = await Promise.all(
+    candidates.map(async filePath => {
+      try {
+        const st = await stat(filePath)
+        return st.isFile() ? filePath : null
+      } catch {
+        return null
+      }
+    }),
+  )
+
+  return results.find((filePath): filePath is string => filePath !== null) ?? null
+}
+
 // exported for testing
 export function getNodeEnv(): string {
   return process.env.NODE_ENV || 'development'
@@ -3828,10 +3868,15 @@ async function loadSessionFile(sessionId: UUID): Promise<{
   contextCollapseCommits: ContextCollapseCommitEntry[]
   contextCollapseSnapshot: ContextCollapseSnapshotEntry | undefined
 }> {
-  const sessionFile = join(
-    getSessionProjectDir() ?? getProjectDir(getOriginalCwd()),
-    `${sessionId}.jsonl`,
-  )
+  const sessionFile = await findSessionFileById(sessionId)
+  if (!sessionFile) {
+    return loadTranscriptFile(
+      join(
+        getSessionProjectDir() ?? getProjectDir(getOriginalCwd()),
+        `${sessionId}.jsonl`,
+      ),
+    )
+  }
   return loadTranscriptFile(sessionFile)
 }
 
@@ -3869,6 +3914,9 @@ export async function doesMessageExistInSession(
 export async function getLastSessionLog(
   sessionId: UUID,
 ): Promise<LogOption | null> {
+  const sessionFile = await findSessionFileById(sessionId)
+  if (!sessionFile) return null
+
   // Single read: load all session data at once instead of reading the file twice
   const {
     messages,
@@ -3882,7 +3930,7 @@ export async function getLastSessionLog(
     contentReplacements,
     contextCollapseCommits,
     contextCollapseSnapshot,
-  } = await loadSessionFile(sessionId)
+  } = await loadTranscriptFile(sessionFile)
   if (messages.size === 0) return null
   // Prime getSessionMessages cache so recordTranscript (called after REPL
   // mount on --resume) skips a second full file load. -170~227ms on large sessions.
@@ -3915,7 +3963,7 @@ export async function getLastSessionLog(
       customTitle,
       buildFileHistorySnapshotChain(fileHistorySnapshots, transcript),
       tag,
-      getTranscriptPathForSession(sessionId),
+      sessionFile,
       buildAttributionSnapshotChain(attributionSnapshots, transcript),
       agentSetting,
       contentReplacements.get(sessionId) ?? [],

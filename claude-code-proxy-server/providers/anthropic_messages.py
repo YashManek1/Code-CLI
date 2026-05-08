@@ -122,9 +122,12 @@ class AnthropicMessagesTransport(BaseProvider):
             self._extract_model_ids_from_model_list_payload(payload)
         )
 
-    def _request_headers(self) -> dict[str, str]:
+    def _request_headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         """Return headers for the native messages request."""
-        return {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
+        if extra:
+            headers.update(extra)
+        return headers
 
     def _build_request_body(
         self, request: Any, thinking_enabled: bool | None = None
@@ -137,13 +140,15 @@ class AnthropicMessagesTransport(BaseProvider):
             thinking_enabled=thinking_enabled,
         )
 
-    async def _send_stream_request(self, body: dict) -> httpx.Response:
+    async def _send_stream_request(
+        self, body: dict, extra_headers: dict[str, str] | None = None
+    ) -> httpx.Response:
         """Create a streaming messages response."""
         request = self._client.build_request(
             "POST",
             "/messages",
             json=body,
-            headers=self._request_headers(),
+            headers=self._request_headers(extra_headers),
         )
         return await self._client.send(request, stream=True)
 
@@ -337,6 +342,9 @@ class AnthropicMessagesTransport(BaseProvider):
         req_tag = f" request_id={request_id}" if request_id else ""
         body = self._build_request_body(request, thinking_enabled=thinking_enabled)
         thinking_enabled = self._is_thinking_enabled(request, thinking_enabled)
+        forwarded_headers: dict[str, str] | None = getattr(
+            request, "forwarded_headers", None
+        )
 
         logger.info(
             "{}_STREAM:{} natively passing Anthropic request model={} msgs={} tools={}",
@@ -357,7 +365,9 @@ class AnthropicMessagesTransport(BaseProvider):
 
                 async def _validated_stream_send() -> httpx.Response:
                     """Send request; raise inside retry loop on 429 so rate limiter can backoff."""
-                    send_response = await self._send_stream_request(body)
+                    send_response = await self._send_stream_request(
+                        body, forwarded_headers
+                    )
                     if send_response.status_code == 429:
                         await send_response.aclose()
                         send_response.raise_for_status()

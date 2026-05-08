@@ -21,6 +21,7 @@ from .model_router import ModelRouter
 from .models.anthropic import MessagesRequest, TokenCountRequest
 from .models.responses import TokenCountResponse
 from .optimization_handlers import try_optimizations
+from .response_cache import dedupe_and_cache_stream
 from .web_tools.egress import WebFetchEgressPolicy
 from .web_tools.request import (
     is_web_server_tool_request,
@@ -158,12 +159,18 @@ class ClaudeProxyService:
             input_tokens = self._token_counter(
                 routed.request.messages, routed.request.system, routed.request.tools
             )
+            provider_stream = provider.stream_response(
+                routed.request,
+                input_tokens=input_tokens,
+                request_id=request_id,
+                thinking_enabled=routed.resolved.thinking_enabled,
+            )
             return anthropic_sse_streaming_response(
-                provider.stream_response(
+                dedupe_and_cache_stream(
                     routed.request,
-                    input_tokens=input_tokens,
+                    provider_id=routed.resolved.provider_id,
                     request_id=request_id,
-                    thinking_enabled=routed.resolved.thinking_enabled,
+                    factory=lambda: provider_stream,
                 ),
             )
 

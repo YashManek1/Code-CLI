@@ -1,5 +1,6 @@
-from __future__ import annotations
 """Centralized configuration using Pydantic Settings."""
+
+from __future__ import annotations
 
 import os
 from collections.abc import Mapping

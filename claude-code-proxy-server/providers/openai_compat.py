@@ -77,27 +77,26 @@ class OpenAIChatTransport(BaseProvider):
             rate_window=config.rate_window,
             max_concurrency=config.max_concurrency,
         )
-        http_client = None
-        if config.proxy:
-            http_client = httpx.AsyncClient(
-                proxy=config.proxy,
-                timeout=httpx.Timeout(
-                    config.http_read_timeout,
-                    connect=config.http_connect_timeout,
-                    read=config.http_read_timeout,
-                    write=config.http_write_timeout,
-                ),
-            )
+        timeout = httpx.Timeout(
+            config.http_read_timeout,
+            connect=config.http_connect_timeout,
+            read=config.http_read_timeout,
+            write=config.http_write_timeout,
+        )
+        http_client = httpx.AsyncClient(
+            proxy=config.proxy or None,
+            timeout=timeout,
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=10),
+            headers={
+                "Accept-Encoding": "gzip",
+                "Connection": "keep-alive",
+            },
+        )
         self._client = AsyncOpenAI(
             api_key=self._api_key,
             base_url=self._base_url,
             max_retries=0,
-            timeout=httpx.Timeout(
-                config.http_read_timeout,
-                connect=config.http_connect_timeout,
-                read=config.http_read_timeout,
-                write=config.http_write_timeout,
-            ),
+            timeout=timeout,
             http_client=http_client,
         )
 
@@ -168,8 +167,25 @@ class OpenAIChatTransport(BaseProvider):
             tc_index = len(sse.blocks.tool_states)
 
         fn_delta = tc.get("function", {})
+
         incoming_name = fn_delta.get("name")
-        arguments = fn_delta.get("arguments", "") or ""
+
+        raw_arguments = fn_delta.get("arguments")
+
+        if raw_arguments is None:
+            arguments = ""
+        elif isinstance(raw_arguments, str):
+            arguments = raw_arguments
+        else:
+            arguments = json.dumps(raw_arguments, ensure_ascii=False)
+
+        logger.warning(
+            "TOOL_CALL_DEBUG index={} id={} name={} args={}",
+            tc.get("index", 0),
+            tc.get("id"),
+            incoming_name,
+            arguments,
+        )
 
         if tc.get("id") is not None:
             sse.blocks.set_stream_tool_id(tc_index, tc.get("id"))
@@ -275,6 +291,9 @@ class OpenAIChatTransport(BaseProvider):
 
                     choice = chunk.choices[0]
                     delta = choice.delta
+
+                    logger.warning("RAW_DELTA {}", delta)
+
                     if delta is None:
                         continue
 
@@ -298,8 +317,9 @@ class OpenAIChatTransport(BaseProvider):
                         yield event
 
                     # Handle text content
-                    if delta.content:
-                        for part in think_parser.feed(delta.content):
+                    content = getattr(delta, "content", None)
+                    if content:
+                        for part in think_parser.feed(content):
                             if part.type == ContentType.THINKING:
                                 if not thinking_enabled:
                                     continue
@@ -323,18 +343,28 @@ class OpenAIChatTransport(BaseProvider):
                                         yield event
 
                     # Handle native tool calls
-                    if delta.tool_calls:
+                    tool_calls = getattr(delta, "tool_calls", None)
+
+                    if tool_calls:
                         for event in sse.close_content_blocks():
                             yield event
-                        for tc in delta.tool_calls:
+
+                        for tc in tool_calls:
+                            tc_function = getattr(tc, "function", None)
+
                             tc_info = {
-                                "index": tc.index,
-                                "id": tc.id,
+                                "index": getattr(tc, "index", 0),
+                                "id": getattr(tc, "id", None),
                                 "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments,
+                                    "name": getattr(tc_function, "name", None)
+                                    if tc_function
+                                    else None,
+                                    "arguments": getattr(tc_function, "arguments", "")
+                                    if tc_function
+                                    else "",
                                 },
                             }
+
                             for event in self._process_tool_call(tc_info, sse):
                                 yield event
 

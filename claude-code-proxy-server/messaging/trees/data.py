@@ -1,11 +1,12 @@
-from __future__ import annotations
 """Tree data structures for message queue.
 
 Contains MessageState, MessageNode, and MessageTree classes.
 """
 
+from __future__ import annotations
+
 import asyncio
-from collections import deque
+from collections import Counter, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -22,21 +23,23 @@ class _SnapshotQueue:
 
     def __init__(self) -> None:
         self._deque: deque[str] = deque()
-        self._set: set[str] = set()
+        self._counts: Counter[str] = Counter()
 
     async def put(self, item: str) -> None:
         self._deque.append(item)
-        self._set.add(item)
+        self._counts[item] += 1
 
     def put_nowait(self, item: str) -> None:
         self._deque.append(item)
-        self._set.add(item)
+        self._counts[item] += 1
 
     def get_nowait(self) -> str:
         if not self._deque:
             raise asyncio.QueueEmpty()
         item = self._deque.popleft()
-        self._set.discard(item)
+        self._counts[item] -= 1
+        if self._counts[item] <= 0:
+            del self._counts[item]
         return item
 
     def qsize(self) -> int:
@@ -48,9 +51,9 @@ class _SnapshotQueue:
 
     def remove_if_present(self, item: str) -> bool:
         """Remove item from queue if present (O(1) membership check). Returns True if removed."""
-        if item not in self._set:
+        if item not in self._counts:
             return False
-        self._set.discard(item)
+        del self._counts[item]
         self._deque = deque(x for x in self._deque if x != item)
         return True
 

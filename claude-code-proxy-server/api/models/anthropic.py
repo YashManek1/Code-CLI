@@ -145,6 +145,7 @@ class MessagesRequest(BaseModel):
     output_config: dict[str, Any] | None = None
     mcp_servers: list[dict[str, Any]] | None = None
     extra_body: dict[str, Any] | None = None
+    forwarded_headers: dict[str, str] | None = Field(default=None, exclude=True)
 
 
 class TokenCountRequest(BaseModel):

@@ -10,7 +10,8 @@ import type { KeybindingBlock } from './types.js'
  */
 
 // Platform-specific image paste shortcut:
-// - Windows: alt+v (ctrl+v is system paste)
+// - Windows: keep alt+v because many terminals consume ctrl+v for system paste.
+//   Also bind ctrl+v below as a best-effort path for terminals that pass it through.
 // - Other platforms: ctrl+v
 const IMAGE_PASTE_KEY = getPlatform() === 'windows' ? 'alt+v' : 'ctrl+v'
 
@@ -85,6 +86,9 @@ export const DEFAULT_BINDINGS: KeybindingBlock[] = [
       'ctrl+s': 'chat:stash',
       // Image paste shortcut (platform-specific key defined above)
       [IMAGE_PASTE_KEY]: 'chat:imagePaste',
+      ...(getPlatform() === 'windows'
+        ? { 'ctrl+v': 'chat:imagePaste' as const }
+        : {}),
       ...(feature('MESSAGE_ACTIONS')
         ? { 'shift+up': 'chat:messageActions' as const }
         : {}),

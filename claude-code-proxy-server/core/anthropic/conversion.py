@@ -411,7 +411,7 @@ class AnthropicToOpenAIConverter:
     def _convert_user_message_with_injection(
         content: list[Any], pending: _PendingAfterTools
     ) -> dict[str, Any]:
-        """Convert user list blocks, emitting deferred assistant after all tool results."""
+        """Convert user list blocks, preserving original text tool flow."""
         if not pending.needs_deferred() or not pending.remaining_tool_ids:
             return {
                 "messages": AnthropicToOpenAIConverter._convert_user_message(content),
@@ -424,74 +424,151 @@ class AnthropicToOpenAIConverter:
 
         def flush_text() -> None:
             if text_parts:
-                result.append({"role": "user", "content": "\n".join(text_parts)})
+                result.append(
+                    {
+                        "role": "user",
+                        "content": "\n".join(text_parts),
+                    }
+                )
                 text_parts.clear()
 
         for block in content:
             block_type = get_block_type(block)
+
             if block_type == "text":
                 text_parts.append(get_block_attr(block, "text", ""))
+
             elif block_type == "image":
-                raise OpenAIConversionError(
-                    "User message image blocks are not supported for OpenAI chat "
-                    "conversion; use a vision-capable native Anthropic provider or "
-                    "extend the converter."
+                flush_text()
+
+                source = get_block_attr(block, "source", {})
+
+                if not isinstance(source, dict):
+                    raise OpenAIConversionError(
+                        "Invalid Anthropic image source format."
+                    )
+
+                if source.get("type") != "base64":
+                    raise OpenAIConversionError(
+                        "Only base64 image blocks are supported."
+                    )
+
+                media_type = source.get("media_type")
+                image_data = source.get("data")
+
+                if not media_type or not image_data:
+                    raise OpenAIConversionError(
+                        "Anthropic image block missing media_type or data."
+                    )
+
+                result.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{media_type};base64,{image_data}"
+                                },
+                            }
+                        ],
+                    }
                 )
+
             elif block_type == "tool_result":
                 flush_text()
+
                 tool_content = get_block_attr(block, "content", "")
                 serialized = _serialize_tool_result_content(tool_content)
-                tuid = get_block_attr(block, "tool_use_id")
-                tuid_s = str(tuid) if tuid is not None else ""
+
+                tool_use_id = get_block_attr(block, "tool_use_id")
+                tool_use_id_string = (
+                    str(tool_use_id) if tool_use_id is not None else ""
+                )
+
                 result.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tuid,
+                        "tool_call_id": tool_use_id,
                         "content": serialized if serialized else "",
                     }
                 )
-                if tuid_s in pending.remaining_tool_ids:
-                    pending.remaining_tool_ids.discard(tuid_s)
+
+                if tool_use_id_string in pending.remaining_tool_ids:
+                    pending.remaining_tool_ids.discard(tool_use_id_string)
+
                 if not pending.remaining_tool_ids:
                     result.extend(
                         AnthropicToOpenAIConverter._deferred_post_tool_to_messages(
                             pending
                         )
                     )
+
                     pending.deferred_emitted = True
                     cleared = True
-            else:
-                pass
 
         flush_text()
-        return {"messages": result, "cleared_pending": cleared}
 
+        return {
+            "messages": result,
+            "cleared_pending": cleared,
+        }
+    
     @staticmethod
     def _convert_user_message(content: list[Any]) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
         text_parts: list[str] = []
-
-        def flush_text() -> None:
-            if text_parts:
-                result.append({"role": "user", "content": "\n".join(text_parts)})
-                text_parts.clear()
+        tool_messages: list[dict[str, Any]] = []
+        image_messages: list[dict[str, Any]] = []
 
         for block in content:
             block_type = get_block_type(block)
 
             if block_type == "text":
-                text_parts.append(get_block_attr(block, "text", ""))
+                text = get_block_attr(block, "text", "")
+
+                if text:
+                    text_parts.append(text)
+
             elif block_type == "image":
-                raise OpenAIConversionError(
-                    "User message image blocks are not supported for OpenAI chat "
-                    "conversion; use a vision-capable native Anthropic provider or "
-                    "extend the converter."
+                source = get_block_attr(block, "source", {})
+
+                if not isinstance(source, dict):
+                    raise OpenAIConversionError(
+                        "Invalid Anthropic image source format."
+                    )
+
+                if source.get("type") != "base64":
+                    raise OpenAIConversionError(
+                        "Only base64 image blocks are supported."
+                    )
+
+                media_type = source.get("media_type")
+                image_data = source.get("data")
+
+                if not media_type or not image_data:
+                    raise OpenAIConversionError(
+                        "Anthropic image block missing media_type or data."
+                    )
+
+                image_messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{media_type};base64,{image_data}"
+                                },
+                            }
+                        ],
+                    }
                 )
+
             elif block_type == "tool_result":
-                flush_text()
                 tool_content = get_block_attr(block, "content", "")
                 serialized = _serialize_tool_result_content(tool_content)
-                result.append(
+
+                tool_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": get_block_attr(block, "tool_use_id"),
@@ -499,9 +576,21 @@ class AnthropicToOpenAIConverter:
                     }
                 )
 
-        flush_text()
-        return result
+        result: list[dict[str, Any]] = []
 
+        if text_parts:
+            result.append(
+                {
+                    "role": "user",
+                    "content": "\n".join(text_parts),
+                }
+            )
+
+        result.extend(image_messages)
+        result.extend(tool_messages)
+
+        return result
+    
     @staticmethod
     def convert_tools(tools: list[Any]) -> list[dict[str, Any]]:
         return [

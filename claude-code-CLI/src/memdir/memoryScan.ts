@@ -4,22 +4,28 @@
  * the API-client chain (which closed a cycle through memdir.ts — #25372).
  */
 
-import { readdir } from 'fs/promises'
-import { basename, join } from 'path'
-import { parseFrontmatter } from '../utils/frontmatterParser.js'
-import { readFileInRange } from '../utils/readFileInRange.js'
-import { type MemoryType, parseMemoryType } from './memoryTypes.js'
+import { readdir } from "fs/promises";
+import { basename, join } from "path";
+import { parseFrontmatter } from "../utils/frontmatterParser.js";
+import { readFileInRange } from "../utils/readFileInRange.js";
+import { type MemoryType, parseMemoryType } from "./memoryTypes.js";
 
 export type MemoryHeader = {
-  filename: string
-  filePath: string
-  mtimeMs: number
-  description: string | null
-  type: MemoryType | undefined
-}
+  filename: string;
+  filePath: string;
+  mtimeMs: number;
+  description: string | null;
+  type: MemoryType | undefined;
+};
 
-const MAX_MEMORY_FILES = 200
-const FRONTMATTER_MAX_LINES = 30
+const MAX_MEMORY_FILES = 200;
+const FRONTMATTER_MAX_LINES = 30;
+const MEMORY_SCAN_CACHE_TTL_MS = 30_000;
+
+const memoryScanCache = new Map<
+  string,
+  { scannedAt: number; entries: MemoryHeader[] }
+>();
 
 /**
  * Scan a memory directory for .md files, read their frontmatter, and return
@@ -36,43 +42,57 @@ export async function scanMemoryFiles(
   memoryDir: string,
   signal: AbortSignal,
 ): Promise<MemoryHeader[]> {
+  if (signal.aborted) {
+    return [];
+  }
+
+  const cached = memoryScanCache.get(memoryDir);
+  if (cached && Date.now() - cached.scannedAt < MEMORY_SCAN_CACHE_TTL_MS) {
+    return cached.entries;
+  }
+
   try {
-    const entries = await readdir(memoryDir, { recursive: true })
+    const entries = await readdir(memoryDir, { recursive: true });
     const mdFiles = entries.filter(
-      f => f.endsWith('.md') && basename(f) !== 'MEMORY.md',
-    )
+      (f) => f.endsWith(".md") && basename(f) !== "MEMORY.md",
+    );
 
     const headerResults = await Promise.allSettled(
       mdFiles.map(async (relativePath): Promise<MemoryHeader> => {
-        const filePath = join(memoryDir, relativePath)
+        const filePath = join(memoryDir, relativePath);
         const { content, mtimeMs } = await readFileInRange(
           filePath,
           0,
           FRONTMATTER_MAX_LINES,
           undefined,
           signal,
-        )
-        const { frontmatter } = parseFrontmatter(content, filePath)
+        );
+        const { frontmatter } = parseFrontmatter(content, filePath);
         return {
           filename: relativePath,
           filePath,
           mtimeMs,
           description: frontmatter.description || null,
           type: parseMemoryType(frontmatter.type),
-        }
+        };
       }),
-    )
+    );
 
-    return headerResults
+    const result = headerResults
       .filter(
         (r): r is PromiseFulfilledResult<MemoryHeader> =>
-          r.status === 'fulfilled',
+          r.status === "fulfilled",
       )
-      .map(r => r.value)
+      .map((r) => r.value)
       .sort((a, b) => b.mtimeMs - a.mtimeMs)
-      .slice(0, MAX_MEMORY_FILES)
+      .slice(0, MAX_MEMORY_FILES);
+    memoryScanCache.set(memoryDir, {
+      scannedAt: Date.now(),
+      entries: result,
+    });
+    return result;
   } catch {
-    return []
+    return [];
   }
 }
 
@@ -83,13 +103,12 @@ export async function scanMemoryFiles(
  */
 export function formatMemoryManifest(memories: MemoryHeader[]): string {
   return memories
-    .map(m => {
-      const tag = m.type ? `[${m.type}] ` : ''
-      const ts = new Date(m.mtimeMs).toISOString()
+    .map((m) => {
+      const tag = m.type ? `[${m.type}] ` : "";
+      const ts = new Date(m.mtimeMs).toISOString();
       return m.description
         ? `- ${tag}${m.filename} (${ts}): ${m.description}`
-        : `- ${tag}${m.filename} (${ts})`
+        : `- ${tag}${m.filename} (${ts})`;
     })
-    .join('\n')
+    .join("\n");
 }
-

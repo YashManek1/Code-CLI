@@ -94,7 +94,13 @@ async def test_init_uses_configurable_timeouts():
         http_connect_timeout=5.0,
     )
     with patch("providers.openai_compat.AsyncOpenAI") as mock_openai:
-        NvidiaNimProvider(config, nim_settings=NimSettings())
+        with patch("providers.openai_compat.httpx.AsyncClient") as mock_async_client:
+            NvidiaNimProvider(config, nim_settings=NimSettings())
+        client_kwargs = mock_async_client.call_args.kwargs
+        assert client_kwargs["headers"]["Accept-Encoding"] == "gzip"
+        assert client_kwargs["headers"]["Connection"] == "keep-alive"
+        assert client_kwargs["limits"].max_connections == 10
+        assert client_kwargs["limits"].max_keepalive_connections == 10
         call_kwargs = mock_openai.call_args[1]
         timeout = call_kwargs["timeout"]
         assert timeout.read == 600.0

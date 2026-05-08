@@ -28,6 +28,8 @@ type SupportedPlatform = 'darwin' | 'linux' | 'win32'
 
 // Threshold in characters for when to consider text a "large paste"
 export const PASTE_THRESHOLD = 800
+const CLIPBOARD_COMMAND_TIMEOUT_MS = 2_000
+
 function getClipboardCommands() {
   const platform = process.platform as SupportedPlatform
 
@@ -71,9 +73,9 @@ function getClipboardCommands() {
     },
     win32: {
       checkImage:
-        'powershell -NoProfile -Command "(Get-Clipboard -Format Image) -ne $null"',
-      saveImage: `powershell -NoProfile -Command "$img = Get-Clipboard -Format Image; if ($img) { $img.Save('${screenshotPath.replace(/\\/g, '\\\\')}', [System.Drawing.Imaging.ImageFormat]::Png) }"`,
-      getPath: 'powershell -NoProfile -Command "Get-Clipboard"',
+        'powershell -NoProfile -STA -Command "$img = Get-Clipboard -Format Image; if ($null -ne $img) { exit 0 }; exit 1"',
+      saveImage: `powershell -NoProfile -STA -Command "$img = Get-Clipboard -Format Image; if ($img) { $img.Save('${screenshotPath.replace(/\\/g, '\\\\')}', [System.Drawing.Imaging.ImageFormat]::Png) }"`,
+      getPath: 'powershell -NoProfile -STA -Command "Get-Clipboard"',
       deleteFile: `del /f "${screenshotPath}"`,
     },
   }
@@ -94,7 +96,7 @@ export type ImageWithDimensions = {
  * Check if clipboard contains an image without retrieving it.
  */
 export async function hasImageInClipboard(): Promise<boolean> {
-  if (process.platform !== 'darwin') {
+  if (process.platform !== 'darwin' && process.platform !== 'win32') {
     return false
   }
   if (
@@ -114,11 +116,22 @@ export async function hasImageInClipboard(): Promise<boolean> {
       logError(e as Error)
     }
   }
-  const result = await execFileNoThrowWithCwd('osascript', [
-    '-e',
-    'the clipboard as «class PNGf»',
-  ])
-  return result.code === 0
+  if (process.platform === 'darwin') {
+    const result = await execFileNoThrowWithCwd(
+      'osascript',
+      ['-e', 'the clipboard as «class PNGf»'],
+      { timeout: CLIPBOARD_COMMAND_TIMEOUT_MS },
+    )
+    return result.code === 0
+  }
+
+  const { commands } = getClipboardCommands()
+  const result = await execa(commands.checkImage, {
+    shell: true,
+    reject: false,
+    timeout: CLIPBOARD_COMMAND_TIMEOUT_MS,
+  })
+  return result.exitCode === 0
 }
 
 export async function getImageFromClipboard(): Promise<ImageWithDimensions | null> {
@@ -189,6 +202,7 @@ export async function getImageFromClipboard(): Promise<ImageWithDimensions | nul
     const checkResult = await execa(commands.checkImage, {
       shell: true,
       reject: false,
+      timeout: CLIPBOARD_COMMAND_TIMEOUT_MS,
     })
     if (checkResult.exitCode !== 0) {
       return null
@@ -198,6 +212,7 @@ export async function getImageFromClipboard(): Promise<ImageWithDimensions | nul
     const saveResult = await execa(commands.saveImage, {
       shell: true,
       reject: false,
+      timeout: CLIPBOARD_COMMAND_TIMEOUT_MS,
     })
     if (saveResult.exitCode !== 0) {
       return null
@@ -229,7 +244,11 @@ export async function getImageFromClipboard(): Promise<ImageWithDimensions | nul
     const mediaType = detectImageFormatFromBase64(base64Image)
 
     // Cleanup (fire-and-forget, don't await)
-    void execa(commands.deleteFile, { shell: true, reject: false })
+    void execa(commands.deleteFile, {
+      shell: true,
+      reject: false,
+      timeout: CLIPBOARD_COMMAND_TIMEOUT_MS,
+    })
 
     return {
       base64: base64Image,
@@ -249,6 +268,7 @@ export async function getImagePathFromClipboard(): Promise<string | null> {
     const result = await execa(commands.getPath, {
       shell: true,
       reject: false,
+      timeout: CLIPBOARD_COMMAND_TIMEOUT_MS,
     })
     if (result.exitCode !== 0 || !result.stdout) {
       return null

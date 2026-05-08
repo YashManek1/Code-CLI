@@ -20,7 +20,9 @@
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
     "format": "biome format --write src/",
-    "check": "biome check src/ && tsc --noEmit"
+    "source:audit": "bun scripts/source-audit.ts",
+    "source:audit:strict": "bun scripts/source-audit.ts --strict",
+    "check": "biome check src/ && bun scripts/source-audit.ts && tsc --noEmit"
   },
   "dependencies": {
     "@alcalzone/ansi-tokenize": "^0.3.0",
