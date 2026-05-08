@@ -489,7 +489,11 @@ class AnthropicToOpenAIConverter:
                 result.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tool_use_id,
+                        "tool_call_id": (
+                            str(tool_use_id)
+                            if tool_use_id is not None
+                            else ""
+                        ),
                         "content": serialized if serialized else "",
                     }
                 )
@@ -571,7 +575,9 @@ class AnthropicToOpenAIConverter:
                 tool_messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": get_block_attr(block, "tool_use_id"),
+                        "tool_call_id": str(
+                            get_block_attr(block, "tool_use_id")
+                        ),
                         "content": serialized if serialized else "",
                     }
                 )
