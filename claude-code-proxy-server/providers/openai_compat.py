@@ -282,7 +282,20 @@ class OpenAIChatTransport(BaseProvider):
         async with self._global_rate_limiter.concurrency_slot():
             try:
                 stream, body = await self._create_stream(body)
-                async for chunk in stream:
+
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            stream.__anext__(),
+                            timeout=20.0,
+                        )
+                    except TimeoutError:
+                        logger.warning("{}_STREAM: keepalive heartbeat", tag)
+                        yield ": keepalive\n\n"
+                        continue
+                    except StopAsyncIteration:
+                        break
+
                     if getattr(chunk, "usage", None):
                         usage_info = chunk.usage
 
@@ -356,12 +369,16 @@ class OpenAIChatTransport(BaseProvider):
                                 "index": getattr(tc, "index", 0),
                                 "id": getattr(tc, "id", None),
                                 "function": {
-                                    "name": getattr(tc_function, "name", None)
-                                    if tc_function
-                                    else None,
-                                    "arguments": getattr(tc_function, "arguments", "")
-                                    if tc_function
-                                    else "",
+                                    "name": (
+                                        getattr(tc_function, "name", None)
+                                        if tc_function
+                                        else None
+                                    ),
+                                    "arguments": (
+                                        getattr(tc_function, "arguments", "")
+                                        if tc_function
+                                        else ""
+                                    ),
                                 },
                             }
 
@@ -371,6 +388,7 @@ class OpenAIChatTransport(BaseProvider):
             except (asyncio.CancelledError, GeneratorExit):
                 raise
             except Exception as e:
+                logger.exception("STREAM_EXCEPTION")
                 self._log_stream_transport_error(tag, req_tag, e)
                 mapped_e = map_error(e, rate_limiter=self._global_rate_limiter)
                 base_message = user_visible_message_for_mapped_provider_error(
