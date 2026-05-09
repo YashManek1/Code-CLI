@@ -17,7 +17,6 @@ from openai import AsyncOpenAI
 
 from core.anthropic import (
     ContentType,
-    HeuristicToolParser,
     SSEBuilder,
     ThinkTagParser,
     append_request_id,
@@ -31,29 +30,6 @@ from providers.error_mapping import (
 from providers.model_listing import extract_openai_model_ids
 from providers.rate_limit import GlobalRateLimiter
 
-
-def _iter_heuristic_tool_use_sse(
-    sse: SSEBuilder, tool_use: dict[str, Any]
-) -> Iterator[str]:
-    """Emit SSE for one heuristic tool_use block (closes open text/thinking first)."""
-    if tool_use.get("name") == "Task" and isinstance(tool_use.get("input"), dict):
-        task_input = tool_use["input"]
-        if task_input.get("run_in_background") is not False:
-            task_input["run_in_background"] = False
-    yield from sse.close_content_blocks()
-    block_idx = sse.blocks.allocate_index()
-    yield sse.content_block_start(
-        block_idx,
-        "tool_use",
-        id=tool_use["id"],
-        name=tool_use["name"],
-    )
-    yield sse.content_block_delta(
-        block_idx,
-        "input_json_delta",
-        json.dumps(tool_use["input"]),
-    )
-    yield sse.content_block_stop(block_idx)
 
 
 class OpenAIChatTransport(BaseProvider):
@@ -275,7 +251,6 @@ class OpenAIChatTransport(BaseProvider):
         yield sse.message_start()
 
         think_parser = ThinkTagParser()
-        heuristic_parser = HeuristicToolParser()
         finish_reason = None
         usage_info = None
 
@@ -331,30 +306,24 @@ class OpenAIChatTransport(BaseProvider):
 
                     # Handle text content
                     content = getattr(delta, "content", None)
+
                     if content:
                         for part in think_parser.feed(content):
                             if part.type == ContentType.THINKING:
                                 if not thinking_enabled:
                                     continue
+
                                 for event in sse.ensure_thinking_block():
                                     yield event
-                                yield sse.emit_thinking_delta(part.content)
-                            else:
-                                filtered_text, detected_tools = heuristic_parser.feed(
-                                    part.content
-                                )
 
-                                if filtered_text:
+                                yield sse.emit_thinking_delta(part.content)
+
+                            else:
+                                if part.content:
                                     for event in sse.ensure_text_block():
                                         yield event
-                                    yield sse.emit_text_delta(filtered_text)
 
-                                for tool_use in detected_tools:
-                                    for event in _iter_heuristic_tool_use_sse(
-                                        sse, tool_use
-                                    ):
-                                        yield event
-
+                                    yield sse.emit_text_delta(part.content)
                     # Handle native tool calls
                     tool_calls = getattr(delta, "tool_calls", None)
 
@@ -430,10 +399,6 @@ class OpenAIChatTransport(BaseProvider):
                 for event in sse.ensure_text_block():
                     yield event
                 yield sse.emit_text_delta(remaining.content)
-
-        for tool_use in heuristic_parser.flush():
-            for event in _iter_heuristic_tool_use_sse(sse, tool_use):
-                yield event
 
         has_started_tool = any(s.started for s in sse.blocks.tool_states.values())
         has_content_blocks = (
