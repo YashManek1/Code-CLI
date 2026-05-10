@@ -190,7 +190,7 @@ class Settings(BaseSettings):
         default=1800.0, validation_alias="HTTP_READ_TIMEOUT"
     )
     http_write_timeout: float = Field(
-        default=10.0, validation_alias="HTTP_WRITE_TIMEOUT"
+        default=300.0, validation_alias="HTTP_WRITE_TIMEOUT"
     )
     http_connect_timeout: float = Field(
         default=HTTP_CONNECT_TIMEOUT_DEFAULT,
