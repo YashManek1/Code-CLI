@@ -1,4 +1,24 @@
-"""SSE event builder for Anthropic-format streaming responses."""
+"""SSE event builder for Anthropic-format streaming responses.
+
+Enhancements over the original:
+- ``ContentBlockManager.flush_tool_call_buffer`` – when ``buffer_tool_calls``
+  quirk is active (MiniMax etc.) every argument chunk is held in a per-tool
+  string buffer and only emitted as a **single** ``input_json_delta`` after the
+  stream closes.  This eliminates truncated / split JSON that confuses Claude Code.
+- ``repair_tool_arguments`` is called via :mod:`tools` before the final emit so
+  malformed JSON from weak models is salvaged before Claude Code sees it.
+- ``ToolCallState.raw_arg_buffer`` – new field that accumulates *all* raw chunks
+  (not just Task args) so the transport layer can trigger JSON repair at close time.
+- ``SSEBuilder.emit_buffered_tool_args`` – called by the transport after the
+  stream ends; emits repaired, single-chunk deltas for every buffered tool.
+
+FIX LOG (MiniMax m2.7):
+  - register_tool_name: completely rewritten to prevent "read_fileread_file"
+    duplication. NIM sends the full tool name on EVERY chunk delta (not just the
+    first). The old logic concatenated name + chunk, producing doubled names.
+    New logic: set name on first arrival, ignore identical or shorter repeats,
+    only append if chunk is genuinely a suffix continuation.
+"""
 
 import hashlib
 import json
@@ -56,9 +76,18 @@ class ToolCallState:
     name: str
     contents: list[str] = field(default_factory=list)
     started: bool = False
+
+    # Task-arg buffering (original – single JSON object expected)
     task_arg_buffer: str = ""
     task_args_emitted: bool = False
     pre_start_args: str = ""
+
+    # Full raw-arg buffer used when ``buffer_tool_calls=True`` (MiniMax mode).
+    # All streaming chunks are concatenated here; JSON repair + single-emit
+    # happens in ``SSEBuilder.emit_buffered_tool_args`` after stream close.
+    raw_arg_buffer: str = ""
+    # Set to True once ``emit_buffered_tool_args`` has processed this tool.
+    buffered_args_emitted: bool = False
 
 
 @dataclass
@@ -84,31 +113,74 @@ class ContentBlockManager:
         return self.tool_states[index]
 
     def set_stream_tool_id(self, index: int, tool_id: str | None) -> None:
-        """Record OpenAI tool call id before ``content_block_start`` (split-stream providers)."""
+        """Record OpenAI tool call id before ``content_block_start``."""
         if not tool_id:
             return
         state = self.ensure_tool_state(index)
         state.tool_id = str(tool_id)
 
     def register_tool_name(self, index: int, name: str) -> None:
-        """Record tool name fragments as they arrive from chunked OpenAI streams.
+        """Record tool name as it arrives from the stream.
 
-        Names may be split across deltas; later chunks can extend (``ab`` + ``c``)
-        or repeat prefixes, so we merge conservatively.
+        FIX: The original logic concatenated name fragments which caused
+        "read_fileread_file" duplication when NIM (and some other providers)
+        send the FULL tool name on every streaming chunk rather than only on
+        the first chunk.
+
+        New logic:
+        1. If name is empty, ignore.
+        2. If state has no name yet, set it unconditionally.
+        3. If incoming name == existing name (exact repeat), ignore it.
+        4. If existing name starts with incoming name (incoming is a prefix),
+           keep existing (it's already longer / complete).
+        5. If incoming name starts with existing name (incoming is a suffix
+           continuation), update to incoming (normal streaming accumulation).
+        6. Otherwise the names are unrelated — keep existing (first-write-wins).
+           Log a warning so we can debug unexpected patterns.
         """
+        if not name:
+            return
         if index not in self.tool_states:
             self.tool_states[index] = ToolCallState(
                 block_index=-1, tool_id="", name=name
             )
             return
+
         state = self.tool_states[index]
-        prev = state.name
-        if not prev or name.startswith(prev):
+        existing = state.name
+
+        if not existing:
+            # First name arrival
             state.name = name
-        elif not prev.startswith(name):
-            state.name = prev + name
+            return
+
+        if name == existing:
+            # Exact duplicate — NIM sends full name on every chunk; ignore
+            return
+
+        if existing.startswith(name):
+            # Incoming is a prefix of what we already have — keep existing
+            return
+
+        if name.startswith(existing):
+            # Incoming is a suffix extension — update (normal streaming)
+            state.name = name
+            return
+
+        # Names diverge — keep first-write-wins, log for debugging
+        logger.warning(
+            "TOOL_NAME_CONFLICT: index={} existing='{}' incoming='{}' — keeping existing",
+            index,
+            existing,
+            name,
+        )
+
+    # ------------------------------------------------------------------
+    # Task-arg buffering (original behaviour, preserved)
+    # ------------------------------------------------------------------
 
     def buffer_task_args(self, index: int, args: str) -> dict | None:
+        """Buffer Task tool args and return parsed dict when complete."""
         state = self.tool_states.get(index)
         if state is None or state.task_args_emitted:
             return None
@@ -120,7 +192,6 @@ class ContentBlockManager:
             return None
 
         _normalize_task_run_in_background(args_json)
-
         state.task_args_emitted = True
         state.task_arg_buffer = ""
         return args_json
@@ -130,6 +201,7 @@ class ContentBlockManager:
         return any(s.started for s in self.tool_states.values())
 
     def flush_task_arg_buffers(self) -> list[tuple[int, str]]:
+        """Flush still-incomplete Task arg buffers (best-effort, called at stream end)."""
         results: list[tuple[int, str]] = []
         for tool_index, state in list(self.tool_states.items()):
             if not state.task_arg_buffer or state.task_args_emitted:
@@ -159,13 +231,20 @@ class ContentBlockManager:
 
 
 def _normalize_task_run_in_background(args_json: dict) -> None:
-    """Force Claude Code Task subagents to run in foreground (single shared rule)."""
+    """Force Claude Code Task subagents to run in foreground."""
     if args_json.get("run_in_background") is not False:
         args_json["run_in_background"] = False
 
 
 class SSEBuilder:
-    """Builder for Anthropic SSE streaming events."""
+    """Builder for Anthropic SSE streaming events.
+
+    When constructed with ``buffer_tool_calls=True`` (set automatically for
+    MiniMax and other weak models by the transport layer), tool argument deltas
+    are **not** emitted inline.  Instead they are accumulated in
+    ``ToolCallState.raw_arg_buffer`` and a single repaired delta is emitted
+    by ``emit_buffered_tool_args()`` after the stream closes.
+    """
 
     def __init__(
         self,
@@ -174,14 +253,20 @@ class SSEBuilder:
         input_tokens: int = 0,
         *,
         log_raw_events: bool = False,
+        buffer_tool_calls: bool = False,
     ):
         self.message_id = message_id
         self.model = model
         self.input_tokens = input_tokens
         self._log_raw_events = log_raw_events
+        self._buffer_tool_calls = buffer_tool_calls
         self.blocks = ContentBlockManager()
         self._accumulated_text_parts: list[str] = []
         self._accumulated_reasoning_parts: list[str] = []
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
 
     def _format_event(self, event_type: str, data: dict) -> str:
         event_str = format_sse_event(event_type, data)
@@ -194,6 +279,10 @@ class SSEBuilder:
                 len(event_str.encode("utf-8")),
             )
         return event_str
+
+    # ------------------------------------------------------------------
+    # Message envelope events
+    # ------------------------------------------------------------------
 
     def message_start(self) -> str:
         safe_input = _safe_usage_int(self.input_tokens)
@@ -232,6 +321,10 @@ class SSEBuilder:
 
     def message_stop(self) -> str:
         return self._format_event("message_stop", {"type": "message_stop"})
+
+    # ------------------------------------------------------------------
+    # Content block primitives
+    # ------------------------------------------------------------------
 
     def content_block_start(self, index: int, block_type: str, **kwargs) -> str:
         content_block: dict = {"type": block_type}
@@ -274,11 +367,12 @@ class SSEBuilder:
     def content_block_stop(self, index: int) -> str:
         return self._format_event(
             "content_block_stop",
-            {
-                "type": "content_block_stop",
-                "index": index,
-            },
+            {"type": "content_block_stop", "index": index},
         )
+
+    # ------------------------------------------------------------------
+    # Thinking block helpers
+    # ------------------------------------------------------------------
 
     def start_thinking_block(self) -> str:
         self.blocks.thinking_index = self.blocks.allocate_index()
@@ -295,6 +389,10 @@ class SSEBuilder:
         self.blocks.thinking_started = False
         return self.content_block_stop(self.blocks.thinking_index)
 
+    # ------------------------------------------------------------------
+    # Text block helpers
+    # ------------------------------------------------------------------
+
     def start_text_block(self) -> str:
         self.blocks.text_index = self.blocks.allocate_index()
         self.blocks.text_started = True
@@ -307,6 +405,10 @@ class SSEBuilder:
     def stop_text_block(self) -> str:
         self.blocks.text_started = False
         return self.content_block_stop(self.blocks.text_index)
+
+    # ------------------------------------------------------------------
+    # Tool block helpers
+    # ------------------------------------------------------------------
 
     def start_tool_block(self, tool_index: int, tool_id: str, name: str) -> str:
         block_idx = self.blocks.allocate_index()
@@ -325,8 +427,21 @@ class SSEBuilder:
         return self.content_block_start(block_idx, "tool_use", id=tool_id, name=name)
 
     def emit_tool_delta(self, tool_index: int, partial_json: str) -> str:
+        """Emit one ``input_json_delta``.
+
+        If ``buffer_tool_calls`` mode is active the chunk is stored in
+        ``raw_arg_buffer`` and **nothing is yielded yet** – call
+        ``emit_buffered_tool_args`` after the stream ends instead.
+        """
         state = self.blocks.tool_states[tool_index]
         state.contents.append(partial_json)
+
+        if self._buffer_tool_calls:
+            # Accumulate silently; emit via emit_buffered_tool_args later.
+            state.raw_arg_buffer += partial_json
+            # Return an empty string – callers must handle this gracefully.
+            return ""
+
         return self.content_block_delta(
             state.block_index, "input_json_delta", partial_json
         )
@@ -334,6 +449,50 @@ class SSEBuilder:
     def stop_tool_block(self, tool_index: int) -> str:
         block_idx = self.blocks.tool_states[tool_index].block_index
         return self.content_block_stop(block_idx)
+
+    # ------------------------------------------------------------------
+    # Buffered tool-arg emission (MiniMax / weak-model path)
+    # ------------------------------------------------------------------
+
+    def emit_buffered_tool_args(self, model: str = "") -> Iterator[str]:
+        """Emit repaired, single-chunk ``input_json_delta`` for every buffered tool.
+
+        Must be called **after** the upstream stream closes and before
+        ``close_all_blocks``.  Has no effect when ``buffer_tool_calls=False``
+        or when no tool has a non-empty ``raw_arg_buffer``.
+        """
+        if not self._buffer_tool_calls:
+            return
+
+        # Lazy import to avoid circular dep at module load time.
+        from core.anthropic.tools import repair_tool_arguments  # type: ignore[import]
+
+        for tool_index, state in self.blocks.tool_states.items():
+            if not state.started or state.buffered_args_emitted:
+                continue
+            state.buffered_args_emitted = True
+
+            raw = state.raw_arg_buffer
+            if not raw:
+                # Emit empty-object delta so Claude Code gets valid JSON
+                repaired = "{}"
+            else:
+                repaired = repair_tool_arguments(raw, tool_name=state.name, model=model)
+
+            logger.debug(
+                "BUFFERED_TOOL_EMIT: tool={} index={} raw_len={} repaired_len={}",
+                state.name,
+                tool_index,
+                len(raw),
+                len(repaired),
+            )
+            yield self.content_block_delta(
+                state.block_index, "input_json_delta", repaired
+            )
+
+    # ------------------------------------------------------------------
+    # Block lifecycle helpers
+    # ------------------------------------------------------------------
 
     def ensure_thinking_block(self) -> Iterator[str]:
         if self.blocks.text_started:
@@ -359,6 +518,10 @@ class SSEBuilder:
             if state.started:
                 yield self.stop_tool_block(tool_index)
 
+    # ------------------------------------------------------------------
+    # Error helpers
+    # ------------------------------------------------------------------
+
     def emit_error(self, error_message: str) -> Iterator[str]:
         error_index = self.blocks.allocate_index()
         yield self.content_block_start(error_index, "text")
@@ -366,17 +529,18 @@ class SSEBuilder:
         yield self.content_block_stop(error_index)
 
     def emit_top_level_error(self, error_message: str) -> str:
-        """Emit a top-level ``event: error`` (not assistant text) for transport failures."""
+        """Emit a top-level ``event: error`` for transport failures."""
         return self._format_event(
             "error",
             {
                 "type": "error",
-                "error": {
-                    "type": "api_error",
-                    "message": error_message,
-                },
+                "error": {"type": "api_error", "message": error_message},
             },
         )
+
+    # ------------------------------------------------------------------
+    # Accumulated text / token estimation
+    # ------------------------------------------------------------------
 
     @property
     def accumulated_text(self) -> str:
@@ -400,7 +564,6 @@ class SSEBuilder:
                 tool_tokens += 15
                 if state.started:
                     started_tool_count += 1
-
             block_count = (
                 (1 if accumulated_reasoning else 0)
                 + (1 if accumulated_text else 0)
@@ -410,7 +573,5 @@ class SSEBuilder:
 
         text_tokens = len(accumulated_text) // 4
         reasoning_tokens = len(accumulated_reasoning) // 4
-        tool_tokens = (
-            sum(1 for state in self.blocks.tool_states.values() if state.started) * 50
-        )
+        tool_tokens = sum(1 for s in self.blocks.tool_states.values() if s.started) * 50
         return text_tokens + reasoning_tokens + tool_tokens

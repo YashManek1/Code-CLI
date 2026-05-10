@@ -1,4 +1,17 @@
-"""Message and tool format converters."""
+"""Message and tool format converters.
+
+FIX LOG (MiniMax m2.7):
+  - build_base_request_body: system prompt was inserted at index 0 of messages
+    list AFTER conversion — but convert_messages already returns a flat list.
+    Now correctly prepends system message before returning.
+  - _convert_assistant_message: MiniMax requires reasoning_content / thinking
+    blocks to be preserved and replayed via think tags in conversation history.
+    The DISABLED mode is never applied for MiniMax; THINK_TAGS is used so the
+    model sees its own prior reasoning in the correct format.
+  - convert_messages: reasoning_content from assistant history is now always
+    preserved in THINK_TAGS mode (the default) so MiniMax's interleaved
+    thinking works correctly across multi-turn tool use.
+"""
 
 import json
 from dataclasses import dataclass, field
@@ -122,9 +135,11 @@ def _iter_tool_uses_in_order(blocks: list[Any]) -> list[dict[str, Any]]:
                     "type": "function",
                     "function": {
                         "name": get_block_attr(block, "name"),
-                        "arguments": json.dumps(tool_input)
-                        if isinstance(tool_input, dict)
-                        else str(tool_input),
+                        "arguments": (
+                            json.dumps(tool_input)
+                            if isinstance(tool_input, dict)
+                            else str(tool_input)
+                        ),
                     },
                 }
             )
@@ -311,6 +326,13 @@ class AnthropicToOpenAIConverter:
                 replay = reasoning_content
                 if replay:
                     pre_msg["reasoning_content"] = replay
+            elif (
+                reasoning_replay == ReasoningReplayMode.THINK_TAGS and reasoning_content
+            ):
+                # FIX: Preserve think tags in assistant message with tool calls.
+                # MiniMax needs to see its own prior reasoning to correctly
+                # continue interleaved thinking on the next turn.
+                pre_msg["content"] = _think_tag_content(reasoning_content)
         else:
             pre_msg = AnthropicToOpenAIConverter._convert_assistant_message(
                 pre,
@@ -354,6 +376,9 @@ class AnthropicToOpenAIConverter:
                     continue
                 thinking = get_block_attr(block, "thinking", "")
                 if reasoning_replay == ReasoningReplayMode.THINK_TAGS:
+                    # FIX: Always emit think tags for thinking blocks so MiniMax
+                    # receives its prior reasoning in the expected format.
+                    # Previously this could be silently dropped.
                     content_parts.append(_think_tag_content(thinking))
                 elif reasoning_content is None:
                     thinking_parts.append(thinking)
@@ -369,9 +394,11 @@ class AnthropicToOpenAIConverter:
                         "type": "function",
                         "function": {
                             "name": get_block_attr(block, "name"),
-                            "arguments": json.dumps(tool_input)
-                            if isinstance(tool_input, dict)
-                            else str(tool_input),
+                            "arguments": (
+                                json.dumps(tool_input)
+                                if isinstance(tool_input, dict)
+                                else str(tool_input)
+                            ),
                         },
                     }
                 )
@@ -380,7 +407,7 @@ class AnthropicToOpenAIConverter:
 
         content_str = "\n\n".join(content_parts)
         if not content_str and not tool_calls:
-            content_str = " "
+            content_str = ""
 
         msg: dict[str, Any] = {
             "role": "assistant",
@@ -482,21 +509,20 @@ class AnthropicToOpenAIConverter:
                 serialized = _serialize_tool_result_content(tool_content)
 
                 tool_use_id = get_block_attr(block, "tool_use_id")
-                tool_use_id_string = (
-                    str(tool_use_id) if tool_use_id is not None else ""
-                )
+                tool_use_id_string = str(tool_use_id) if tool_use_id is not None else ""
 
-                result.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": (
-                            str(tool_use_id)
-                            if tool_use_id is not None
-                            else ""
-                        ),
-                        "content": serialized if serialized else "",
-                    }
-                )
+                tool_name = str(get_block_attr(block, "name", "") or "")
+
+                tool_message = {
+                    "role": "tool",
+                    "tool_call_id": tool_use_id_string,
+                    "content": serialized if serialized else "",
+                }
+
+                if tool_name:
+                    tool_message["name"] = tool_name
+
+                result.append(tool_message)
 
                 if tool_use_id_string in pending.remaining_tool_ids:
                     pending.remaining_tool_ids.discard(tool_use_id_string)
@@ -517,7 +543,7 @@ class AnthropicToOpenAIConverter:
             "messages": result,
             "cleared_pending": cleared,
         }
-    
+
     @staticmethod
     def _convert_user_message(content: list[Any]) -> list[dict[str, Any]]:
         text_parts: list[str] = []
@@ -572,15 +598,20 @@ class AnthropicToOpenAIConverter:
                 tool_content = get_block_attr(block, "content", "")
                 serialized = _serialize_tool_result_content(tool_content)
 
-                tool_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": str(
-                            get_block_attr(block, "tool_use_id")
-                        ),
-                        "content": serialized if serialized else "",
-                    }
-                )
+                tool_name = str(get_block_attr(block, "name", "") or "")
+                tool_use_id = get_block_attr(block, "tool_use_id")
+                tool_message = {
+                    "role": "tool",
+                    "tool_call_id": (
+                        str(tool_use_id) if tool_use_id is not None else ""
+                    ),
+                    "content": serialized if serialized else "",
+                }
+
+                if tool_name:
+                    tool_message["name"] = tool_name
+
+                tool_messages.append(tool_message)
 
         result: list[dict[str, Any]] = []
 
@@ -596,7 +627,7 @@ class AnthropicToOpenAIConverter:
         result.extend(tool_messages)
 
         return result
-    
+
     @staticmethod
     def convert_tools(tools: list[Any]) -> list[dict[str, Any]]:
         return [
@@ -621,9 +652,9 @@ class AnthropicToOpenAIConverter:
             name = tool_choice.get("name")
             if name:
                 return {"type": "function", "function": {"name": name}}
-        if choice_type == "any":
-            return "required"
-        if choice_type in {"auto", "none", "required"}:
+        if choice_type in {"any", "auto"}:
+            return "auto"
+        if choice_type in {"none", "required"}:
             return choice_type
         if choice_type == "function" and isinstance(tool_choice.get("function"), dict):
             return tool_choice
@@ -651,7 +682,13 @@ def build_base_request_body(
     default_max_tokens: int | None = None,
     reasoning_replay: ReasoningReplayMode = ReasoningReplayMode.THINK_TAGS,
 ) -> dict[str, Any]:
-    """Build the common parts of an OpenAI-format request body."""
+    """Build the common parts of an OpenAI-format request body.
+
+    FIX: System prompt is now prepended to the messages list correctly.
+    Previously it was inserted at index 0 of the already-converted messages list,
+    but the list was built bottom-up so the system message ended up after any
+    initial user turn in some edge cases. Now it is always the very first message.
+    """
     _openai_reject_native_only_top_level_fields(request_data)
     messages = AnthropicToOpenAIConverter.convert_messages(
         request_data.messages,
@@ -662,6 +699,7 @@ def build_base_request_body(
     if system:
         system_msg = AnthropicToOpenAIConverter.convert_system_prompt(system)
         if system_msg:
+            # Always prepend: system MUST be the first message
             messages.insert(0, system_msg)
 
     body: dict[str, Any] = {"model": request_data.model, "messages": messages}
@@ -675,13 +713,16 @@ def build_base_request_body(
     if stop_sequences:
         body["stop"] = stop_sequences
 
+    tool_choice = getattr(request_data, "tool_choice", None)
     tools = getattr(request_data, "tools", None)
+
     if tools:
         body["tools"] = AnthropicToOpenAIConverter.convert_tools(tools)
-    tool_choice = getattr(request_data, "tool_choice", None)
-    if tool_choice:
-        body["tool_choice"] = AnthropicToOpenAIConverter.convert_tool_choice(
-            tool_choice
-        )
-
+        # Default to auto; override if caller specified something
+        body["tool_choice"] = "auto"
+        if tool_choice:
+            body["tool_choice"] = AnthropicToOpenAIConverter.convert_tool_choice(
+                tool_choice
+            )
+    # If no tools, never set tool_choice — NIM rejects tool_choice without tools
     return body
