@@ -64,8 +64,11 @@ def _safe_usage_int(value: object) -> int:
 
 def format_sse_event(event_type: str, data: dict) -> str:
     """Format one Anthropic-style SSE event (no logging)."""
-    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
-
+    return f"event: {event_type}\ndata: {json.dumps(
+        data,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )}\n\n"
 
 @dataclass
 class ToolCallState:
@@ -270,6 +273,12 @@ class SSEBuilder:
 
     def _format_event(self, event_type: str, data: dict) -> str:
         event_str = format_sse_event(event_type, data)
+        if not event_str.strip():
+            logger.warning(
+                "SSE_SKIP: empty serialized event {}",
+                event_type,
+            )
+            return ""
         if self._log_raw_events:
             logger.debug("SSE_EVENT: {} - {}", event_type, event_str.strip())
         else:
@@ -426,7 +435,7 @@ class SSEBuilder:
             )
         return self.content_block_start(block_idx, "tool_use", id=tool_id, name=name)
 
-    def emit_tool_delta(self, tool_index: int, partial_json: str) -> str:
+    def emit_tool_delta(self, tool_index: int, partial_json: str) -> str | None:
         """Emit one ``input_json_delta``.
 
         If ``buffer_tool_calls`` mode is active the chunk is stored in
@@ -439,8 +448,7 @@ class SSEBuilder:
         if self._buffer_tool_calls:
             # Accumulate silently; emit via emit_buffered_tool_args later.
             state.raw_arg_buffer += partial_json
-            # Return an empty string – callers must handle this gracefully.
-            return ""
+            return None
 
         return self.content_block_delta(
             state.block_index, "input_json_delta", partial_json
@@ -478,6 +486,14 @@ class SSEBuilder:
                 repaired = "{}"
             else:
                 repaired = repair_tool_arguments(raw, tool_name=state.name, model=model)
+                try:
+                    json.loads(repaired)
+                except Exception:
+                    logger.warning(
+                        "BUFFERED_TOOL_INVALID_JSON: tool={}",
+                        state.name,
+                    )
+                    repaired = "{}"
 
             logger.debug(
                 "BUFFERED_TOOL_EMIT: tool={} index={} raw_len={} repaired_len={}",
@@ -515,7 +531,10 @@ class SSEBuilder:
     def close_all_blocks(self) -> Iterator[str]:
         yield from self.close_content_blocks()
         for tool_index, state in list(self.blocks.tool_states.items()):
-            if state.started:
+            if (
+                state.started
+                and state.block_index >= 0
+            ):
                 yield self.stop_tool_block(tool_index)
 
     # ------------------------------------------------------------------

@@ -282,8 +282,11 @@ class OpenAIChatTransport(BaseProvider):
     # Pending tool-call accumulation helpers (MiniMax buffered path)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _validate_and_repair_pending_tool(tc_info: dict, model: str) -> dict | None:
+    def _validate_and_repair_pending_tool(
+        self,
+        tc_info: dict,
+        model: str,
+    ) -> dict | None:
         """Validate / repair one fully-accumulated tool call.
 
         Returns the (possibly mutated) ``tc_info`` dict on success, or
@@ -309,12 +312,14 @@ class OpenAIChatTransport(BaseProvider):
             return None
 
         # Quick parse attempt first (avoids repair overhead for healthy models)
-        try:
-            parsed = json.loads(arguments)
-            function_data["arguments"] = json.dumps(parsed, ensure_ascii=False)
+        parsed = self._safe_json_loads(arguments)
+
+        if parsed is not None:
+            function_data["arguments"] = json.dumps(
+                parsed,
+                ensure_ascii=False,
+            )
             return tc_info
-        except json.JSONDecodeError:
-            pass
 
         # Invoke multi-strategy repair
         tool_name = function_data.get("name", "")
@@ -344,15 +349,17 @@ class OpenAIChatTransport(BaseProvider):
             )
             return False
         return True
-    
-    @staticmethod
-    def _is_tool_call_complete(tc_info: dict) -> bool:
+
+    def _is_tool_call_complete(
+        self,
+        tc_info: dict,
+    ) -> bool:
         function_data = tc_info.get("function", {})
         tool_name = function_data.get("name", "")
         arguments = function_data.get("arguments", "{}")
 
         try:
-            parsed = json.loads(arguments)
+            parsed = self._safe_json_loads(arguments)
         except Exception:
             return False
 
@@ -382,6 +389,31 @@ class OpenAIChatTransport(BaseProvider):
             return "description" in parsed
 
         return True
+
+    def _safe_json_loads(self, raw: str) -> dict | list | None:
+        """Safely parse provider JSON fragments."""
+        if not raw:
+            return None
+
+        if not isinstance(raw, str):
+            return None
+
+        raw = raw.strip()
+
+        if not raw:
+            return None
+
+        if raw == "[DONE]":
+            return None
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning(
+                "STREAM_JSON_SKIP: malformed/empty JSON fragment len={}",
+                len(raw),
+            )
+            return None
     # ------------------------------------------------------------------
     # Public streaming interface
     # ------------------------------------------------------------------
@@ -471,6 +503,9 @@ class OpenAIChatTransport(BaseProvider):
                             stream.__anext__(),
                             timeout=chunk_timeout,
                         )
+                        if chunk is None:
+                            logger.warning("STREAM_SKIP: received None chunk")
+                            continue
                     except TimeoutError:
                         logger.warning(
                             "{}_STREAM: keepalive heartbeat (timeout={}s)",
@@ -478,7 +513,7 @@ class OpenAIChatTransport(BaseProvider):
                             chunk_timeout,
                         )
                         try:
-                            yield ": keepalive\n\n"
+                            yield "event: ping\ndata: {\"alive\":true}\n\n"
                         except Exception:
                             logger.warning(
                                 "{}_STREAM: client disconnected during keepalive",
@@ -492,16 +527,19 @@ class OpenAIChatTransport(BaseProvider):
                     if getattr(chunk, "usage", None):
                         usage_info = chunk.usage
 
-                    if not chunk.choices:
+                    choices = getattr(chunk, "choices", None)
+                    if not choices:
+                        logger.debug("STREAM_SKIP: empty choices")
                         continue
 
                     choice = chunk.choices[0]
-                    delta = choice.delta
-
-                    logger.debug("RAW_DELTA model={} delta={}", model_str, delta)
+                    delta = getattr(choice, "delta", None)
 
                     if delta is None:
+                        logger.debug("STREAM_SKIP: null delta")
                         continue
+
+                    logger.debug("RAW_DELTA model={} delta={}", model_str, delta)
 
                     if choice.finish_reason:
                         finish_reason = choice.finish_reason
@@ -524,12 +562,9 @@ class OpenAIChatTransport(BaseProvider):
 
                             if not arguments:
                                 continue
-
-                            try:
-                                json.loads(arguments)
-                            except Exception:
+                            parsed = self._safe_json_loads(arguments)
+                            if parsed is None:
                                 continue
-
                             completed_indices.append(tc_index)
 
                         if completed_indices:
@@ -635,17 +670,8 @@ class OpenAIChatTransport(BaseProvider):
                                         replace_valid = False
                                         append_valid = False
 
-                                        try:
-                                            json.loads(candidate_replace)
-                                            replace_valid = True
-                                        except Exception:
-                                            pass
-
-                                        try:
-                                            json.loads(candidate_append)
-                                            append_valid = True
-                                        except Exception:
-                                            pass
+                                        replace_valid = self._safe_json_loads(candidate_replace) is not None
+                                        append_valid = self._safe_json_loads(candidate_append) is not None
 
                                         if replace_valid:
                                             existing["function"][
@@ -662,6 +688,31 @@ class OpenAIChatTransport(BaseProvider):
 
             except (asyncio.CancelledError, GeneratorExit):
                 raise
+            except (
+                json.JSONDecodeError,
+                ValueError,
+                TypeError,
+            ) as e:
+                logger.warning(
+                    "STREAM_RECOVERABLE_PARSE_ERROR: {}",
+                    repr(e),
+                )
+
+                for event in sse.close_all_blocks():
+                    yield event
+
+                for event in sse.emit_error(
+                    append_request_id(
+                        "Recoverable provider stream parse error.",
+                        request_id,
+                    )
+                ):
+                    yield event
+
+                yield sse.message_delta("end_turn", 1)
+                yield sse.message_stop()
+                return
+
             except Exception as e:
                 logger.exception("STREAM_EXCEPTION")
                 self._log_stream_transport_error(tag, req_tag, e)
@@ -880,6 +931,10 @@ class OpenAIChatTransport(BaseProvider):
                     provider_input,
                     provider_input - input_tokens,
                 )
-
+        if not finish_reason:
+            logger.warning(
+                "STREAM_RECOVERY: missing finish_reason, forcing stop"
+            )
+            finish_reason = "stop"
         yield sse.message_delta(map_stop_reason(finish_reason), output_tokens)
         yield sse.message_stop()
