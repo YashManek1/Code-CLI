@@ -17,10 +17,12 @@ from core.anthropic.sse import ANTHROPIC_SSE_RESPONSE_HEADERS
 from providers.base import BaseProvider
 from providers.exceptions import InvalidRequestError, ProviderError
 
+from .execution_state_store import ExecutionStateStore
 from .model_router import ModelRouter
-from .models.anthropic import MessagesRequest, TokenCountRequest
+from .models.anthropic import MessagesRequest, SystemContent, TokenCountRequest
 from .models.responses import TokenCountResponse
 from .optimization_handlers import try_optimizations
+from .orchestration.state_injector import build_orchestration_context
 from .response_cache import dedupe_and_cache_stream
 from .web_tools.egress import WebFetchEgressPolicy
 from .web_tools.request import (
@@ -93,16 +95,88 @@ class ClaudeProxyService:
         provider_getter: ProviderGetter,
         model_router: ModelRouter | None = None,
         token_counter: TokenCounter = get_token_count,
+        execution_state_store: ExecutionStateStore | None = None,
     ):
         self._settings = settings
         self._provider_getter = provider_getter
         self._model_router = model_router or ModelRouter(settings)
         self._token_counter = token_counter
+        self._execution_state_store = execution_state_store
+
+    # ------------------------------------------------------------------
+    # Execution-state orchestration helpers
+    # ------------------------------------------------------------------
+
+    def _extract_session_id(self, request_data: MessagesRequest) -> str | None:
+        """Extract session_id from forwarded headers or metadata."""
+        # Check forwarded headers
+        if request_data.forwarded_headers:
+            for header_name in ("x-session-id", "anthropic-conversation-id"):
+                value = request_data.forwarded_headers.get(header_name)
+                if value:
+                    return value
+        # Check metadata
+        if request_data.metadata:
+            session_id = request_data.metadata.get("session_id")
+            if session_id:
+                return str(session_id)
+        return None
+
+    def _inject_execution_state(
+        self, request_data: MessagesRequest, session_id: str | None
+    ) -> None:
+        """Inject execution state context into the request's system field."""
+        if self._execution_state_store is None or session_id is None:
+            return
+
+        state = self._execution_state_store.load(session_id)
+        if state is None:
+            return
+
+        # Update active model if it changed
+        model_name = request_data.model
+        if model_name and state.active_model != model_name:
+            state.active_model = model_name
+            self._execution_state_store.save(state)
+
+        context = build_orchestration_context(state)
+        if not context:
+            return
+
+        # Inject into system field (Anthropic format — works for all providers)
+        if request_data.system is None:
+            request_data.system = context
+        elif isinstance(request_data.system, str):
+            request_data.system = context + "\n\n" + request_data.system
+        elif isinstance(request_data.system, list):
+            state_block = SystemContent(type="text", text=context)
+            request_data.system = [state_block] + list(request_data.system)
+
+        logger.debug(
+            "EXECUTION_STATE_INJECT: session={} phase={} context_len={}",
+            session_id,
+            state.implementation_phase,
+            len(context),
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def create_message(self, request_data: MessagesRequest) -> object:
         """Create a message response or streaming response."""
         try:
             _require_non_empty_messages(request_data.messages)
+
+            # Inject execution state context before routing
+            session_id = self._extract_session_id(request_data)
+            self._inject_execution_state(request_data, session_id)
+            
+            # Process tool results to advance the orchestration engine
+            if self._execution_state_store is not None and session_id is not None:
+                from .orchestration.response_tracker import ResponseTracker
+                tracker = ResponseTracker(self._execution_state_store)
+                tracker.process_request_messages(session_id, request_data.messages)
 
             routed = self._model_router.resolve_messages_request(request_data)
             if routed.resolved.provider_id in _OPENAI_CHAT_UPSTREAM_IDS:

@@ -23,6 +23,7 @@ import { isFullscreenEnvEnabled } from '../utils/fullscreen.js';
 import { createBaseHookInput, executeStatusLineCommand } from '../utils/hooks.js';
 import { getLastAssistantMessage } from '../utils/messages.js';
 import { getRuntimeMainLoopModel, type ModelName, renderModelName } from '../utils/model/model.js';
+import { fetchExecutionState, type ExecutionState } from '../orchestration/executionState.js';
 import { getCurrentSessionTitle } from '../utils/sessionStorage.js';
 import { doesMostRecentAssistantMessageExceed200k, getCurrentUsage } from '../utils/tokens.js';
 import { getCurrentWorktreeSession } from '../utils/worktree.js';
@@ -141,6 +142,19 @@ function StatusLineInner({
   vimMode
 }: Props): React.ReactNode {
   const abortControllerRef = useRef<AbortController | undefined>(undefined);
+  const [executionState, setExecutionState] = React.useState<ExecutionState | null>(null);
+  
+  useEffect(() => {
+    // Poll the execution state from the proxy periodically
+    const fetchState = async () => {
+      const state = await fetchExecutionState();
+      setExecutionState(state);
+    };
+    void fetchState();
+    const interval = setInterval(() => void fetchState(), 2000);
+    return () => clearInterval(interval);
+  }, []);
+
   const permissionMode = useAppState(s => s.toolPermissionContext.mode);
   const additionalWorkingDirectories = useAppState(s => s.toolPermissionContext.additionalWorkingDirectories);
   const statusLineText = useAppState(s => s.statusLineText);
@@ -314,6 +328,9 @@ function StatusLineInner({
       {statusLineText ? <Text dimColor wrap="truncate">
           <Ansi>{statusLineText}</Ansi>
         </Text> : isFullscreenEnvEnabled() ? <Text> </Text> : null}
+      {executionState?.exists && (
+        <Text dimColor>| Phase: {executionState.implementation_phase}{executionState.approved_plan ? ' (Plan Locked)' : ''}</Text>
+      )}
     </Box>;
 }
 
