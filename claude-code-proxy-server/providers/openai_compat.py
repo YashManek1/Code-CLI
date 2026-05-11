@@ -40,7 +40,6 @@ FIX LOG (MiniMax m2.7):
     because NIM's M2.7 endpoint has long TTFT (~30-45s) before first token.
     For non-MiniMax models the 20s timeout is preserved.
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -334,20 +333,49 @@ class OpenAIChatTransport(BaseProvider):
 
     @staticmethod
     def _check_tool_token_cap(tc_info: dict, quirks: ModelQuirks) -> bool:
-        """Return False (and log) if argument JSON exceeds ``max_tool_tokens``."""
+        """Return False only for dangerous oversized non-file-edit tools."""
+
         cap = quirks.max_tool_tokens
+
         if not cap:
             return True
-        args = tc_info.get("function", {}).get("arguments", "")
-        if len(args) > cap:
-            tool_name = tc_info.get("function", {}).get("name", "?")
+
+        function_data = tc_info.get("function", {})
+        tool_name = function_data.get("name", "?")
+        arguments = function_data.get("arguments", "")
+
+        argument_length = len(arguments)
+
+        # File editing tools legitimately need huge payloads.
+        # Allow them through unless they become absurdly large.
+        if tool_name in {"Write", "Edit", "MultiEdit"}:
+            hard_cap = cap * 4
+
+            if argument_length > hard_cap:
+                logger.warning(
+                    "TOKEN_CAP_HARD_LIMIT: tool '{}' args {} chars > hard_cap {}",
+                    tool_name,
+                    argument_length,
+                    hard_cap,
+                )
+                return False
+
+            logger.info(
+                "TOKEN_CAP_BYPASS: allowing large '{}' payload ({} chars)",
+                tool_name,
+                argument_length,
+            )
+            return True
+
+        if argument_length > cap:
             logger.warning(
                 "TOKEN_CAP: tool '{}' args {} chars > cap {}; skipping",
                 tool_name,
-                len(args),
+                argument_length,
                 cap,
             )
             return False
+
         return True
 
     def _is_tool_call_complete(
@@ -414,6 +442,139 @@ class OpenAIChatTransport(BaseProvider):
                 len(raw),
             )
             return None
+
+    def _normalize_delta_content(
+        self,
+        content: Any,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """
+        Normalize provider delta.content into:
+        1. plain text string
+        2. synthetic tool_calls list
+
+        Handles providers that emit:
+        - plain strings
+        - OpenAI structured content arrays
+        - Anthropic-style content blocks
+        - mixed text/tool arrays
+
+        Prevents stream stalls from list-based content payloads.
+        """
+        if content is None:
+            return "", []
+
+        if isinstance(content, str):
+
+            stripped_content = content.strip()
+
+            # Some OpenAI-compatible providers incorrectly serialize
+            # structured content arrays into JSON strings.
+            if (
+                stripped_content.startswith("[")
+                and stripped_content.endswith("]")
+            ):
+                try:
+                    parsed_content = json.loads(stripped_content)
+
+                    if isinstance(parsed_content, list):
+                        return self._normalize_delta_content(
+                            parsed_content
+                        )
+
+                except Exception:
+                    pass
+            # Strip leaked tool-call protocol tokens
+            tool_protocol_tokens = [
+                "<|tool_call_begin|>",
+                "<|tool_call_end|>",
+                "<|tool_calls_section_begin|>",
+                "<|tool_calls_section_end|>",
+                "<|tool_call_argument_begin|>",
+                "<|tool_call_argument_end|>",
+            ]
+
+            for token in tool_protocol_tokens:
+                stripped_content = stripped_content.replace(token, "")
+            return stripped_content, []
+
+        if not isinstance(content, list):
+            return str(content), []
+
+        text_parts: list[str] = []
+        synthetic_tool_calls: list[dict[str, Any]] = []
+
+        for item in content:
+            if not isinstance(item, dict):
+                text_parts.append(str(item))
+                continue
+
+            item_type = item.get("type")
+
+            # Standard text blocks
+            if item_type in {"text", "output_text"}:
+                text_value = item.get("text", "")
+                if text_value:
+                    text_parts.append(str(text_value))
+                continue
+
+            # Some providers emit reasoning separately
+            if item_type in {"thinking", "reasoning"}:
+                reasoning_text = (
+                    item.get("thinking")
+                    or item.get("reasoning")
+                    or item.get("text")
+                    or ""
+                )
+
+                if reasoning_text:
+                    text_parts.append(str(reasoning_text))
+
+                continue
+
+            # Tool calls embedded directly inside content array
+            if item_type in {"tool_use", "tool_call"}:
+                tool_name = (
+                    item.get("name")
+                    or item.get("tool_name")
+                    or "tool_call"
+                )
+
+                tool_input = (
+                    item.get("input")
+                    or item.get("arguments")
+                    or {}
+                )
+
+                if not isinstance(tool_input, str):
+                    tool_input = json.dumps(
+                        tool_input,
+                        ensure_ascii=False,
+                    )
+
+                synthetic_tool_calls.append(
+                    {
+                        "index": len(synthetic_tool_calls),
+                        "id": item.get("id") or f"tool_{uuid.uuid4()}",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": tool_input,
+                        },
+                    }
+                )
+
+                continue
+            
+        # Fallback text extraction
+            fallback_text = (
+                item.get("text")
+                or item.get("content")
+                or ""
+            )
+
+            if fallback_text:
+                text_parts.append(str(fallback_text))
+
+        return "".join(text_parts), synthetic_tool_calls
     # ------------------------------------------------------------------
     # Public streaming interface
     # ------------------------------------------------------------------
@@ -611,29 +772,64 @@ class OpenAIChatTransport(BaseProvider):
                     # ---------------------------------------------------
                     # Text content
                     # ---------------------------------------------------
-                    content = getattr(delta, "content", None)
-                    if content:
-                        for part in think_parser.feed(content):
+                    raw_content = getattr(delta, "content", None)
+
+                    normalized_text, synthetic_tool_calls = (
+                        self._normalize_delta_content(raw_content)
+                    )
+
+                    if normalized_text:
+                        for part in think_parser.feed(normalized_text):
+
+                            raw_part_content = part.content
+
+                            if isinstance(raw_part_content, list):
+                                normalized_part_content = json.dumps(
+                                    raw_part_content,
+                                    ensure_ascii=False,
+                                )
+                            else:
+                                normalized_part_content = str(raw_part_content)
+
+                            if not normalized_part_content.strip():
+                                continue
+
                             if part.type == ContentType.THINKING:
                                 if not thinking_enabled:
                                     continue
+
                                 for event in sse.ensure_thinking_block():
                                     yield event
-                                yield sse.emit_thinking_delta(part.content)
+
+                                yield sse.emit_thinking_delta(
+                                    normalized_part_content
+                                )
+
                             else:
-                                if part.content and part.content.strip():
-                                    if pending_tool_calls:
-                                        continue
+                                if pending_tool_calls:
+                                    continue
 
-                                    for event in sse.ensure_text_block():
-                                        yield event
+                                for event in sse.ensure_text_block():
+                                    yield event
 
-                                    yield sse.emit_text_delta(part.content)
+                                yield sse.emit_text_delta(
+                                    normalized_part_content
+                                )
+
+                    # Merge synthetic tool calls emitted via structured content arrays
+                    if synthetic_tool_calls:
+                        existing_tool_calls = getattr(delta, "tool_calls", None)
+
+                        if existing_tool_calls:
+                            tool_calls = list(existing_tool_calls) + synthetic_tool_calls
+                        else:
+                            tool_calls = synthetic_tool_calls
+                    else:
+                        tool_calls = getattr(delta, "tool_calls", None)
 
                     # ---------------------------------------------------
                     # Native tool calls – accumulate chunks
                     # ---------------------------------------------------
-                    tool_calls = getattr(delta, "tool_calls", None)
                     if tool_calls:
                         for tc in tool_calls:
                             tc_index = getattr(tc, "index", 0)

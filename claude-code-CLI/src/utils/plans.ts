@@ -133,9 +133,23 @@ export function getPlanFilePath(agentId?: AgentId): string {
  * @param agentId Optional agent ID for subagents. If not provided, returns main session plan.
  */
 export function getPlan(agentId?: AgentId): string | null {
-  const filePath = getPlanFilePath(agentId)
+
   try {
-    return getFsImplementation().readFileSync(filePath, { encoding: 'utf-8' })
+    const activePlan = recoverPlanFromMessages({
+      messages: globalThis.__CLAUDE_TRANSCRIPT_MESSAGES__ ?? [],
+    } as LogOption)
+
+    if (activePlan?.trim()) {
+      return activePlan
+    }
+  } catch { }
+
+  const filePath = getPlanFilePath(agentId)
+
+  try {
+    return getFsImplementation().readFileSync(filePath, {
+      encoding: 'utf-8',
+    })
   } catch (error) {
     if (isENOENT(error)) return null
     logError(error)

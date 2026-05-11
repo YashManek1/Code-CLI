@@ -9,8 +9,16 @@ from providers.registry import ProviderRegistry
 
 from . import dependencies
 from .dependencies import get_settings, require_api_key
+from .execution_state_store import ExecutionStateStore
 from .gateway_model_ids import gateway_model_id, no_thinking_gateway_model_id
 from .models.anthropic import MessagesRequest, TokenCountRequest
+from .models.execution_state import (
+    CheckpointState,
+    ExecutionPhase,
+    ExecutionState,
+    ExecutionStateUpdate,
+    PlanStep,
+)
 from .models.responses import ModelResponse, ModelsListResponse
 from .services import ClaudeProxyService
 
@@ -63,12 +71,14 @@ def get_proxy_service(
     settings: Settings = Depends(get_settings),
 ) -> ClaudeProxyService:
     """Build the request service for route handlers."""
+    execution_state_store = getattr(request.app.state, "execution_state_store", None)
     return ClaudeProxyService(
         settings,
         provider_getter=lambda provider_type: dependencies.resolve_provider(
             provider_type, app=request.app, settings=settings
         ),
         token_counter=get_token_count,
+        execution_state_store=execution_state_store,
     )
 
 
@@ -166,6 +176,8 @@ _FORWARDED_HEADER_NAMES = frozenset(
     {
         "anthropic-beta",
         "anthropic-version",
+        "x-session-id",
+        "anthropic-conversation-id",
     }
 )
 
@@ -289,3 +301,190 @@ async def stop_cli(request: Request, _auth=Depends(require_api_key)):
     count = await handler.stop_all_tasks()
     logger.info("STOP_CLI: source=handler cancelled_count={}", count)
     return {"status": "stopped", "cancelled_count": count}
+
+
+# =============================================================================
+# Execution State Orchestration API
+# =============================================================================
+
+
+def _get_execution_state_store(request: Request) -> ExecutionStateStore:
+    """Retrieve the execution state store from app state."""
+    store = getattr(request.app.state, "execution_state_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="Execution state store not initialized")
+    return store
+
+
+@router.get("/v1/execution_state/{session_id}")
+async def get_execution_state(
+    session_id: str,
+    request: Request,
+    _auth=Depends(require_api_key),
+):
+    """Retrieve the current execution state for a session."""
+    store = _get_execution_state_store(request)
+    state = store.load(session_id)
+    if state is None:
+        return {"session_id": session_id, "exists": False}
+    return {"exists": True, **state.model_dump(mode="json")}
+
+
+@router.put("/v1/execution_state/{session_id}")
+async def update_execution_state(
+    session_id: str,
+    body: dict,
+    request: Request,
+    _auth=Depends(require_api_key),
+):
+    """Update the execution state for a session (partial update)."""
+    store = _get_execution_state_store(request)
+    patch = ExecutionStateUpdate.model_validate(body)
+    updated = store.update(session_id, patch)
+    return {"status": "updated", **updated.model_dump(mode="json")}
+
+
+@router.post("/v1/execution_state/{session_id}/complete_step")
+async def complete_step(
+    session_id: str,
+    body: dict,
+    request: Request,
+    _auth=Depends(require_api_key),
+):
+    """Mark a plan step as completed."""
+    store = _get_execution_state_store(request)
+    step_id = body.get("step_id")
+    if not step_id:
+        raise HTTPException(status_code=400, detail="step_id is required")
+
+    state = store.load(session_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    target_step = None
+    for step in state.remaining_steps:
+        if step.step_id == step_id:
+            target_step = step
+            break
+
+    if target_step is None:
+        raise HTTPException(status_code=404, detail=f"Step {step_id} not found in remaining steps")
+
+    updated = store.append_completed_step(session_id, target_step)
+    if updated is None:
+        raise HTTPException(status_code=500, detail="Failed to update state")
+
+    return {"status": "completed", **updated.model_dump(mode="json")}
+
+
+@router.post("/v1/execution_state/{session_id}/set_checkpoint")
+async def set_checkpoint(
+    session_id: str,
+    body: dict,
+    request: Request,
+    _auth=Depends(require_api_key),
+):
+    """Create or update a checkpoint for a session."""
+    store = _get_execution_state_store(request)
+    name = body.get("name", "checkpoint")
+    description = body.get("description", "")
+    phase_str = body.get("phase")
+
+    state = store.ensure_state(session_id)
+    phase = ExecutionPhase(phase_str) if phase_str else state.implementation_phase
+
+    checkpoint = CheckpointState(
+        name=name,
+        description=description,
+        phase=phase,
+    )
+    updated = store.update(
+        session_id, ExecutionStateUpdate(current_checkpoint=checkpoint)
+    )
+    logger.info(
+        "CHECKPOINT_SET: session={} name={} phase={}", session_id, name, phase
+    )
+    return {"status": "checkpoint_set", **updated.model_dump(mode="json")}
+
+
+@router.post("/v1/execution_state/{session_id}/restore_checkpoint")
+async def restore_checkpoint(
+    session_id: str,
+    request: Request,
+    _auth=Depends(require_api_key),
+):
+    """Restore the active checkpoint for a session."""
+    store = _get_execution_state_store(request)
+    from .orchestration.checkpoint_manager import CheckpointManager
+    manager = CheckpointManager(store)
+    updated = manager.restore_checkpoint(session_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="No checkpoint found to restore")
+    return {"status": "checkpoint_restored", **updated.model_dump(mode="json")}
+
+@router.post("/v1/execution_state/{session_id}/apply_plan")
+async def apply_plan(
+    session_id: str,
+    body: dict,
+    request: Request,
+    _auth=Depends(require_api_key),
+):
+    """Parse and persist an approved execution plan."""
+
+    store = _get_execution_state_store(request)
+
+    from .orchestration.execution_tracker import ExecutionTracker
+
+    tracker = ExecutionTracker(store)
+
+    plan_text = body.get("plan_text")
+
+    if not plan_text:
+        raise HTTPException(
+            status_code=400,
+            detail="plan_text is required",
+        )
+
+    updated = tracker.apply_approved_plan(
+        session_id=session_id,
+        plan_text=plan_text,
+    )
+
+    if updated is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
+        )
+
+    logger.info(
+        "PLAN_APPLIED: session={} steps={}",
+        session_id,
+        len(updated.remaining_steps),
+    )
+
+    return {
+        "status": "plan_applied",
+        **updated.model_dump(mode="json"),
+    }
+
+@router.delete("/v1/execution_state/{session_id}")
+async def delete_execution_state(
+    session_id: str,
+    request: Request,
+    _auth=Depends(require_api_key),
+):
+    """Delete the execution state for a session."""
+    store = _get_execution_state_store(request)
+    deleted = store.delete(session_id)
+    return {"status": "deleted" if deleted else "not_found"}
+
+
+@router.get("/v1/execution_states")
+async def list_execution_states(
+    request: Request,
+    _auth=Depends(require_api_key),
+):
+    """List all sessions with persisted execution state."""
+    store = _get_execution_state_store(request)
+    sessions = store.list_sessions()
+    return {"sessions": sessions, "count": len(sessions)}

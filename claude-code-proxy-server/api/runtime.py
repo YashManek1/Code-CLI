@@ -14,6 +14,8 @@ from config.settings import Settings, get_settings
 from providers.exceptions import ServiceUnavailableError
 from providers.registry import ProviderRegistry
 
+from .execution_state_store import ExecutionStateStore
+
 if TYPE_CHECKING:
     from cli.manager import CLISessionManager
     from messaging.handler import ClaudeMessageHandler
@@ -86,6 +88,7 @@ class AppRuntime:
     app: FastAPI
     settings: Settings
     _provider_registry: ProviderRegistry | None = field(default=None, init=False)
+    _execution_state_store: ExecutionStateStore | None = field(default=None, init=False)
     messaging_platform: MessagingPlatform | None = None
     message_handler: ClaudeMessageHandler | None = None
     cli_manager: CLISessionManager | None = None
@@ -106,6 +109,7 @@ class AppRuntime:
             warn_if_process_auth_token(self.settings)
             await self._provider_registry.validate_configured_models(self.settings)
             self._provider_registry.start_model_list_refresh(self.settings)
+            self._execution_state_store = ExecutionStateStore()
             await self._start_messaging_if_configured()
             self._publish_state()
         except Exception as exc:
@@ -285,6 +289,7 @@ class AppRuntime:
         self.app.state.messaging_platform = self.messaging_platform
         self.app.state.message_handler = self.message_handler
         self.app.state.cli_manager = self.cli_manager
+        self.app.state.execution_state_store = self._execution_state_store
 
     async def _shutdown_limiter(self) -> None:
         verbose = self.settings.log_api_error_tracebacks

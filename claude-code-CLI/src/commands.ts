@@ -6,6 +6,11 @@ import btw from './commands/btw/index.js'
 import goodClaude from './commands/good-claude/index.js'
 import issue from './commands/issue/index.js'
 import feedback from './commands/feedback/index.js'
+import checkpoint from './commands/checkpoint/index.js'
+import phase from './commands/phase/index.js'
+import state from './commands/state/index.js'
+import lockPlan from './commands/lock-plan/index.js'
+import resumeCheckpoint from './commands/resume-checkpoint/index.js'
 import clear from './commands/clear/index.js'
 import color from './commands/color/index.js'
 import commit from './commands/commit.js'
@@ -263,6 +268,7 @@ const COMMANDS = memoize((): Command[] => [
   branch,
   btw,
   chrome,
+  checkpoint,
   clear,
   color,
   compact,
@@ -290,6 +296,7 @@ const COMMANDS = memoize((): Command[] => [
   mobile,
   model,
   outputStyle,
+  phase,
   remoteEnv,
   plugin,
   pr_comments,
@@ -297,16 +304,19 @@ const COMMANDS = memoize((): Command[] => [
   reloadPlugins,
   rename,
   resume,
+  resumeCheckpoint,
   session,
   skills,
   stats,
   status,
+  state,
   statusline,
   stickers,
   tag,
   theme,
   feedback,
   review,
+  lockPlan,
   ultrareview,
   rewind,
   securityReview,

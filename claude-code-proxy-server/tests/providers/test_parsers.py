@@ -508,3 +508,31 @@ def test_heuristic_tool_parser_malformed_function_tag(malformed_text):
     _filtered, tools = parser.feed(malformed_text)
     tools.extend(parser.flush())
     # Should not crash; may or may not detect a tool depending on regex match
+
+
+def test_heuristic_tool_parser_kimi_wrapped_call():
+    parser = HeuristicToolParser(model="moonshotai/kimi-k2-instruct")
+    text = (
+        "lob:0<|tool_call_name_begin|>grep_search<|tool_call_name_end|>\n"
+        "lob:0<|tool_call_argument_begin|>{\"pattern\": \"backend/tests\"}<|tool_call_argument_end|>"
+    )
+    filtered, tools = parser.feed(text)
+    tools.extend(parser.flush())
+
+    assert filtered.strip() == ""
+    assert len(tools) == 1
+    assert tools[0]["name"] == "grep_search"
+    assert tools[0]["input"] == {"pattern": "backend/tests"}
+
+
+def test_heuristic_tool_parser_kimi_leaking_token():
+    parser = HeuristicToolParser(model="moonshotai/kimi-k2-instruct")
+    # Simulation of leaking control token + JSON in content
+    text = "lob:0<|tool_call_argument_begin|>{\"pattern\": \"backend/tests\"}"
+    filtered, tools = parser.feed(text)
+    tools.extend(parser.flush())
+
+    # Should strip the control token
+    assert "<|tool_call_argument_begin|>" not in filtered
+    assert "lob:0" not in filtered
+    assert '{"pattern": "backend/tests"}' in filtered
