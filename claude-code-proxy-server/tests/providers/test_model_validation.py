@@ -63,8 +63,9 @@ async def test_nim_lists_openai_compatible_model_ids() -> None:
         "list",
         new_callable=AsyncMock,
         return_value=SimpleNamespace(data=[SimpleNamespace(id="nvidia/model")]),
-    ):
+    ) as mock_list:
         assert await provider.list_model_ids() == frozenset({"nvidia/model"})
+    mock_list.assert_awaited_once()
 
 
 @pytest.mark.asyncio

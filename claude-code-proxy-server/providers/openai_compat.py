@@ -40,10 +40,14 @@ FIX LOG (MiniMax m2.7):
     because NIM's M2.7 endpoint has long TTFT (~30-45s) before first token.
     For non-MiniMax models the 20s timeout is preserved.
 """
+
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
+import re
+import time
 import uuid
 from abc import abstractmethod
 from collections.abc import AsyncIterator, Iterator
@@ -60,6 +64,13 @@ from core.anthropic import (
     append_request_id,
     map_stop_reason,
 )
+from core.anthropic.tools import (
+    HeuristicToolParser,
+    ModelQuirks,
+    get_model_quirks,
+    prepare_tools_for_model,
+    repair_tool_arguments,
+)
 from providers.base import BaseProvider, ProviderConfig
 from providers.error_mapping import (
     map_error,
@@ -67,12 +78,6 @@ from providers.error_mapping import (
 )
 from providers.model_listing import extract_openai_model_ids
 from providers.rate_limit import GlobalRateLimiter
-from core.anthropic.tools import (
-    ModelQuirks,
-    get_model_quirks,
-    prepare_tools_for_model,
-    repair_tool_arguments,
-)
 
 # Per-model chunk timeout: MiniMax on NIM has very long TTFT
 _DEFAULT_CHUNK_TIMEOUT = 20.0
@@ -107,17 +112,19 @@ class OpenAIChatTransport(BaseProvider):
             write=config.http_write_timeout,
             pool=300.0,
         )
-        http_client = httpx.AsyncClient(
-            proxy=config.proxy or None,
-            timeout=timeout,
-            limits=httpx.Limits(
+        http_client_kwargs: dict[str, Any] = {
+            "timeout": timeout,
+            "limits": httpx.Limits(
                 max_connections=100, max_keepalive_connections=20, keepalive_expiry=120
             ),
-            headers={
+            "headers": {
                 "Accept-Encoding": "gzip",
                 "Connection": "keep-alive",
             },
-        )
+        }
+        if config.proxy:
+            http_client_kwargs["proxy"] = config.proxy
+        http_client = httpx.AsyncClient(**http_client_kwargs)
         self._client = AsyncOpenAI(
             api_key=self._api_key,
             base_url=self._base_url,
@@ -210,15 +217,17 @@ class OpenAIChatTransport(BaseProvider):
         if event:  # empty string when buffer_tool_calls mode is active
             yield event
 
-    def _process_tool_call(self, tc: dict, sse: SSEBuilder) -> Iterator[str]:
+    def _process_tool_call(
+        self, tool_call: dict, sse: SSEBuilder
+    ) -> Iterator[str]:
         """Process a single tool call delta and yield SSE events."""
-        tc_index = tc.get("index", 0)
+        tc_index = tool_call.get("index", 0)
         if tc_index < 0:
             tc_index = len(sse.blocks.tool_states)
 
-        fn_delta = tc.get("function", {})
-        incoming_name = fn_delta.get("name")
-        raw_arguments = fn_delta.get("arguments")
+        function_delta = tool_call.get("function", {})
+        incoming_name = function_delta.get("name")
+        raw_arguments = function_delta.get("arguments")
 
         if raw_arguments is None:
             arguments = ""
@@ -229,22 +238,22 @@ class OpenAIChatTransport(BaseProvider):
 
         logger.debug(
             "TOOL_CALL_DELTA index={} id={} name={} args_len={}",
-            tc.get("index", 0),
-            tc.get("id"),
+            tool_call.get("index", 0),
+            tool_call.get("id"),
             incoming_name,
             len(arguments),
         )
 
-        if tc.get("id") is not None:
-            sse.blocks.set_stream_tool_id(tc_index, tc.get("id"))
+        if tool_call.get("id") is not None:
+            sse.blocks.set_stream_tool_id(tc_index, tool_call.get("id"))
 
         if incoming_name is not None:
             sse.blocks.register_tool_name(tc_index, incoming_name)
 
         state = sse.blocks.tool_states.get(tc_index)
-        resolved_id = (state.tool_id if state and state.tool_id else None) or tc.get(
-            "id"
-        )
+        resolved_id = (
+            state.tool_id if state and state.tool_id else None
+        ) or tool_call.get("id")
         resolved_name = (state.name if state else "") or ""
 
         if not state or not state.started:
@@ -255,9 +264,11 @@ class OpenAIChatTransport(BaseProvider):
                 yield sse.start_tool_block(tc_index, tool_id, display_name)
                 state = sse.blocks.tool_states[tc_index]
                 if state.pre_start_args:
-                    pre = state.pre_start_args
+                    pre_start_arguments = state.pre_start_args
                     state.pre_start_args = ""
-                    yield from self._emit_tool_arg_delta(sse, tc_index, pre)
+                    yield from self._emit_tool_arg_delta(
+                        sse, tc_index, pre_start_arguments
+                    )
 
         state = sse.blocks.tool_states.get(tc_index)
         if not arguments:
@@ -395,10 +406,7 @@ class OpenAIChatTransport(BaseProvider):
             return False
 
         if tool_name == "Write":
-            return (
-                "file_path" in parsed
-                and "content" in parsed
-            )
+            return "file_path" in parsed and "content" in parsed
 
         if tool_name == "Edit":
             return (
@@ -408,10 +416,7 @@ class OpenAIChatTransport(BaseProvider):
             )
 
         if tool_name == "MultiEdit":
-            return (
-                "file_path" in parsed
-                and "edits" in parsed
-            )
+            return "file_path" in parsed and "edits" in parsed
 
         if tool_name == "Task":
             return "description" in parsed
@@ -437,7 +442,7 @@ class OpenAIChatTransport(BaseProvider):
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            logger.warning(
+            logger.debug(
                 "STREAM_JSON_SKIP: malformed/empty JSON fragment len={}",
                 len(raw),
             )
@@ -457,6 +462,7 @@ class OpenAIChatTransport(BaseProvider):
         - OpenAI structured content arrays
         - Anthropic-style content blocks
         - mixed text/tool arrays
+        - Python-repr artifact leaks (Kimi/MiniMax)
 
         Prevents stream stalls from list-based content payloads.
         """
@@ -464,25 +470,6 @@ class OpenAIChatTransport(BaseProvider):
             return "", []
 
         if isinstance(content, str):
-
-            stripped_content = content.strip()
-
-            # Some OpenAI-compatible providers incorrectly serialize
-            # structured content arrays into JSON strings.
-            if (
-                stripped_content.startswith("[")
-                and stripped_content.endswith("]")
-            ):
-                try:
-                    parsed_content = json.loads(stripped_content)
-
-                    if isinstance(parsed_content, list):
-                        return self._normalize_delta_content(
-                            parsed_content
-                        )
-
-                except Exception:
-                    pass
             # Strip leaked tool-call protocol tokens
             tool_protocol_tokens = [
                 "<|tool_call_begin|>",
@@ -492,10 +479,77 @@ class OpenAIChatTransport(BaseProvider):
                 "<|tool_call_argument_begin|>",
                 "<|tool_call_argument_end|>",
             ]
-
             for token in tool_protocol_tokens:
-                stripped_content = stripped_content.replace(token, "")
-            return stripped_content, []
+                content = content.replace(token, "")
+
+            stripped_content = content.strip()
+
+            # Handle Kimi/MiniMax "artifact leaks" where they emit parts of a list wrapper
+            # or Python-repr strings as plain text.
+            if stripped_content in ("[", "]", "[]"):
+                return "", []
+
+            # Python-repr list wrapper: "[{'type':'text',..."
+            if stripped_content.startswith("[{'type':"):
+                try:
+                    parsed = ast.literal_eval(stripped_content)
+                    if isinstance(parsed, list):
+                        return self._normalize_delta_content(parsed)
+                except Exception:
+                    # Fallback for malformed reprs (e.g. unclosed inner lists)
+                    matches = list(
+                        re.finditer(
+                            r"['\"]text['\"]\s*:\s*(?P<quote>['\"])",
+                            stripped_content,
+                        )
+                    )
+                    if matches:
+                        last_match = matches[-1]
+                        quote_character = last_match.group("quote")
+                        text_start_index = last_match.end()
+                        text_end_index = -1
+                        cursor_index = text_start_index
+                        while cursor_index < len(stripped_content):
+                            previous_character = stripped_content[
+                                cursor_index - 1 : cursor_index
+                            ]
+                            current_character = stripped_content[cursor_index]
+                            if (
+                                current_character == quote_character
+                                and previous_character != "\\"
+                            ):
+                                text_end_index = cursor_index
+                                break
+                            cursor_index += 1
+                        if text_end_index != -1:
+                            unquoted_text = stripped_content[
+                                text_start_index:text_end_index
+                            ]
+                        else:
+                            unquoted_text = stripped_content[
+                                text_start_index:
+                            ].rstrip("'] }\"")
+                        return self._normalize_delta_content(
+                            unquoted_text.replace("\\'", "'").replace('\\"', '"')
+                        )
+
+            # Dangling leading bracket or assistant prefix
+            if stripped_content.startswith("[") and not stripped_content.endswith("]"):
+                if stripped_content.startswith("[assistant]"):
+                    return stripped_content.replace("[assistant]", "").strip(), []
+                return stripped_content[1:], []
+
+            # Some OpenAI-compatible providers incorrectly serialize
+            # structured content arrays into JSON strings.
+            if stripped_content.startswith("[") and stripped_content.endswith("]"):
+                try:
+                    parsed_content = json.loads(stripped_content)
+                    if isinstance(parsed_content, list):
+                        return self._normalize_delta_content(parsed_content)
+                except Exception:
+                    pass
+
+            return content, []
 
         if not isinstance(content, list):
             return str(content), []
@@ -514,7 +568,9 @@ class OpenAIChatTransport(BaseProvider):
             if item_type in {"text", "output_text"}:
                 text_value = item.get("text", "")
                 if text_value:
-                    text_parts.append(str(text_value))
+                    # Recursive normalize in case the text is itself a leaked wrapper
+                    norm_text, _ = self._normalize_delta_content(text_value)
+                    text_parts.append(norm_text)
                 continue
 
             # Some providers emit reasoning separately
@@ -525,25 +581,14 @@ class OpenAIChatTransport(BaseProvider):
                     or item.get("text")
                     or ""
                 )
-
                 if reasoning_text:
                     text_parts.append(str(reasoning_text))
-
                 continue
 
             # Tool calls embedded directly inside content array
             if item_type in {"tool_use", "tool_call"}:
-                tool_name = (
-                    item.get("name")
-                    or item.get("tool_name")
-                    or "tool_call"
-                )
-
-                tool_input = (
-                    item.get("input")
-                    or item.get("arguments")
-                    or {}
-                )
+                tool_name = item.get("name") or item.get("tool_name") or "tool_call"
+                tool_input = item.get("input") or item.get("arguments") or {}
 
                 if not isinstance(tool_input, str):
                     tool_input = json.dumps(
@@ -561,16 +606,10 @@ class OpenAIChatTransport(BaseProvider):
                         },
                     }
                 )
-
                 continue
-            
-        # Fallback text extraction
-            fallback_text = (
-                item.get("text")
-                or item.get("content")
-                or ""
-            )
 
+            # Fallback text extraction
+            fallback_text = item.get("text") or item.get("content") or ""
             if fallback_text:
                 text_parts.append(str(fallback_text))
 
@@ -646,6 +685,7 @@ class OpenAIChatTransport(BaseProvider):
 
         yield sse.message_start()
 
+        heuristic_parser = HeuristicToolParser(model=model_str)
         think_parser = ThinkTagParser()
         finish_reason = None
         usage_info = None
@@ -657,6 +697,7 @@ class OpenAIChatTransport(BaseProvider):
         async with self._global_rate_limiter.concurrency_slot():
             try:
                 stream, body = await self._create_stream(body)
+                last_provider_chunk_at = time.monotonic()
 
                 while True:
                     try:
@@ -664,25 +705,45 @@ class OpenAIChatTransport(BaseProvider):
                             stream.__anext__(),
                             timeout=chunk_timeout,
                         )
+                        last_provider_chunk_at = time.monotonic()
                         if chunk is None:
                             logger.warning("STREAM_SKIP: received None chunk")
                             continue
                     except TimeoutError:
+                        idle_s = time.monotonic() - last_provider_chunk_at
+                        if idle_s >= self._config.stream_idle_timeout:
+                            logger.warning(
+                                "{}_STREAM: upstream idle timeout after {:.1f}s{}",
+                                tag,
+                                idle_s,
+                                req_tag,
+                            )
+                            error_message = append_request_id(
+                                (
+                                    f"{tag} stream stalled for "
+                                    f"{self._config.stream_idle_timeout:.0f}s without "
+                                    "provider chunks."
+                                ),
+                                request_id,
+                            )
+                            for event in sse.close_all_blocks():
+                                yield event
+                            if sse.blocks.has_emitted_tool_block():
+                                yield sse.emit_top_level_error(error_message)
+                            else:
+                                for event in sse.emit_error(error_message):
+                                    yield event
+                            yield sse.message_delta("end_turn", 1)
+                            yield sse.message_stop()
+                            return
                         logger.warning(
-                            "{}_STREAM: keepalive heartbeat (timeout={}s)",
+                            "{}_STREAM: waiting for upstream chunk (timeout={}s idle={:.1f}s)",
                             tag,
                             chunk_timeout,
+                            idle_s,
                         )
-                        try:
-                            yield "event: ping\ndata: {\"alive\":true}\n\n"
-                        except Exception:
-                            logger.warning(
-                                "{}_STREAM: client disconnected during keepalive",
-                                tag,
-                            )
-                            break
                         continue
-    
+
                     except StopAsyncIteration:
                         break
                     if getattr(chunk, "usage", None):
@@ -705,55 +766,6 @@ class OpenAIChatTransport(BaseProvider):
                     if choice.finish_reason:
                         finish_reason = choice.finish_reason
                         logger.debug("{} finish_reason: {}", tag, finish_reason)
-
-                    # ---------------------------------------------------
-                    # Flush pending tool calls immediately once arguments
-                    # become valid JSON instead of waiting for finish_reason
-                    # ---------------------------------------------------
-                    if (
-                        pending_tool_calls
-                        and not quirks.buffer_tool_calls
-                        and finish_reason
-                    ):
-                        completed_indices = []
-                        for tc_index, tc_info in pending_tool_calls.items():
-                            arguments = (
-                                tc_info.get("function", {}).get("arguments", "").strip()
-                            )
-
-                            if not arguments:
-                                continue
-                            parsed = self._safe_json_loads(arguments)
-                            if parsed is None:
-                                continue
-                            completed_indices.append(tc_index)
-
-                        if completed_indices:
-                            for event in sse.close_content_blocks():
-                                yield event
-
-                        for tc_index in completed_indices:
-                            tc_info = pending_tool_calls.pop(tc_index)
-
-                            repaired = self._validate_and_repair_pending_tool(
-                                tc_info,
-                                model_str,
-                            )
-
-                            if repaired is None:
-                                continue
-                            if not self._is_tool_call_complete(repaired):
-                                logger.warning(
-                                    "Skipping incomplete tool call '{}'",
-                                    repaired.get("function", {}).get("name", "?"),
-                                )
-                                continue
-
-                            if not self._check_tool_token_cap(repaired, quirks):
-                                continue
-
-                            for event in self._process_tool_call(repaired, sse):
-                                yield event
 
                     # ---------------------------------------------------
                     # Reasoning content
@@ -779,10 +791,28 @@ class OpenAIChatTransport(BaseProvider):
                     )
 
                     if normalized_text:
-                        for part in think_parser.feed(normalized_text):
+                        # Heuristic tool detection for Kimi/MiniMax inline text emission
+                        safe_text, heuristic_tool_calls = heuristic_parser.feed(
+                            normalized_text
+                        )
+                        if heuristic_tool_calls:
+                            # Convert Anthropic-style to OpenAI-style for the transport's accumulation loop
+                            for htc in heuristic_tool_calls:
+                                synthetic_tool_calls.append(
+                                    {
+                                        "index": len(synthetic_tool_calls),
+                                        "id": htc.get("id"),
+                                        "function": {
+                                            "name": htc.get("name"),
+                                            "arguments": json.dumps(
+                                                htc.get("input", {}), ensure_ascii=False
+                                            ),
+                                        },
+                                    }
+                                )
 
+                        for part in think_parser.feed(safe_text):
                             raw_part_content = part.content
-
                             if isinstance(raw_part_content, list):
                                 normalized_part_content = json.dumps(
                                     raw_part_content,
@@ -797,42 +827,41 @@ class OpenAIChatTransport(BaseProvider):
                             if part.type == ContentType.THINKING:
                                 if not thinking_enabled:
                                     continue
-
                                 for event in sse.ensure_thinking_block():
                                     yield event
-
-                                yield sse.emit_thinking_delta(
-                                    normalized_part_content
-                                )
-
+                                yield sse.emit_thinking_delta(normalized_part_content)
                             else:
-                                if pending_tool_calls:
-                                    continue
-
+                                # FIX: Don't skip text even if tools are pending.
+                                # SSEBuilder handles proper interleaving.
                                 for event in sse.ensure_text_block():
                                     yield event
-
-                                yield sse.emit_text_delta(
-                                    normalized_part_content
-                                )
+                                yield sse.emit_text_delta(normalized_part_content)
 
                     # Merge synthetic tool calls emitted via structured content arrays
                     if synthetic_tool_calls:
                         existing_tool_calls = getattr(delta, "tool_calls", None)
-
                         if existing_tool_calls:
-                            tool_calls = list(existing_tool_calls) + synthetic_tool_calls
+                            tool_calls = (
+                                list(existing_tool_calls) + synthetic_tool_calls
+                            )
                         else:
                             tool_calls = synthetic_tool_calls
                     else:
                         tool_calls = getattr(delta, "tool_calls", None)
 
                     # ---------------------------------------------------
-                    # Native tool calls – accumulate chunks
+                    # Native tool calls - accumulate chunks
                     # ---------------------------------------------------
                     if tool_calls:
-                        for tc in tool_calls:
-                            tc_index = getattr(tc, "index", 0)
+                        for tool_call_delta in tool_calls:
+                            # Normalize: handle both OpenAI objects and synthetic dicts
+                            is_dict = isinstance(tool_call_delta, dict)
+                            tc_index = (
+                                tool_call_delta.get("index", 0)
+                                if is_dict
+                                else getattr(tool_call_delta, "index", 0)
+                            )
+
                             existing = pending_tool_calls.setdefault(
                                 tc_index,
                                 {
@@ -842,45 +871,98 @@ class OpenAIChatTransport(BaseProvider):
                                 },
                             )
 
-                            tc_id = getattr(tc, "id", None)
-                            if tc_id:
-                                existing["id"] = tc_id
+                            tool_call_id = (
+                                tool_call_delta.get("id")
+                                if is_dict
+                                else getattr(tool_call_delta, "id", None)
+                            )
+                            if tool_call_id:
+                                existing["id"] = tool_call_id
 
-                            tc_function = getattr(tc, "function", None)
-                            if tc_function:
-                                fn_name = getattr(tc_function, "name", None)
-                                fn_args = getattr(tc_function, "arguments", None)
-                                if fn_name:
-                                    existing["function"]["name"] = fn_name
-                                if fn_args:
-                                    current_arguments = existing["function"][
-                                        "arguments"
-                                    ]
-
-                                    if not current_arguments:
-                                        existing["function"]["arguments"] = fn_args
+                            tool_call_function = (
+                                tool_call_delta.get("function")
+                                if is_dict
+                                else getattr(tool_call_delta, "function", None)
+                            )
+                            if tool_call_function:
+                                function_name = (
+                                    tool_call_function.get("name")
+                                    if is_dict
+                                    else getattr(tool_call_function, "name", None)
+                                )
+                                function_arguments = (
+                                    tool_call_function.get("arguments")
+                                    if is_dict
+                                    else getattr(
+                                        tool_call_function, "arguments", None
+                                    )
+                                )
+                                if function_name:
+                                    existing["function"]["name"] = function_name
+                                if function_arguments:
+                                    current_args = existing["function"]["arguments"]
+                                    if not current_args:
+                                        existing["function"][
+                                            "arguments"
+                                        ] = function_arguments
                                     else:
-                                        candidate_replace = fn_args.strip()
-                                        candidate_append = current_arguments + fn_args
-
-                                        replace_valid = False
-                                        append_valid = False
-
-                                        replace_valid = self._safe_json_loads(candidate_replace) is not None
-                                        append_valid = self._safe_json_loads(candidate_append) is not None
-
-                                        if replace_valid:
+                                        # If chunk looks like a complete JSON block, it might be a replacement.
+                                        # But usually we just append to preserve fragments.
+                                        if function_arguments.strip().startswith(
+                                            "{"
+                                        ) and function_arguments.strip().endswith("}"):
                                             existing["function"][
                                                 "arguments"
-                                            ] = candidate_replace
-                                        elif append_valid:
-                                            existing["function"][
-                                                "arguments"
-                                            ] = candidate_append
+                                            ] = function_arguments
                                         else:
-                                            existing["function"][
-                                                "arguments"
-                                            ] = candidate_append
+                                            existing["function"]["arguments"] = (
+                                                current_args + function_arguments
+                                            )
+
+                    # ---------------------------------------------------
+                    # FIX: Flush pending tool calls AFTER accumulation.
+                    # This ensures the last chunk of arguments is captured.
+                    # ---------------------------------------------------
+                    if (
+                        pending_tool_calls
+                        and not quirks.buffer_tool_calls
+                    ):
+                        completed_indices = []
+                        for tc_index, tc_info in pending_tool_calls.items():
+                            arguments = (
+                                tc_info.get("function", {}).get("arguments", "").strip()
+                            )
+                            if not arguments:
+                                continue
+                            parsed = self._safe_json_loads(arguments)
+                            if parsed is None:
+                                continue
+                            completed_indices.append(tc_index)
+
+                        if completed_indices:
+                            for event in sse.close_content_blocks():
+                                yield event
+
+                        for tc_index in completed_indices:
+                            tc_info = pending_tool_calls.pop(tc_index)
+                            repaired = self._validate_and_repair_pending_tool(
+                                tc_info,
+                                model_str,
+                            )
+                            if repaired is None:
+                                continue
+                            if not self._is_tool_call_complete(repaired):
+                                logger.warning(
+                                    "Skipping incomplete tool call '{}'",
+                                    repaired.get("function", {}).get("name", "?"),
+                                )
+                                continue
+
+                            if not self._check_tool_token_cap(repaired, quirks):
+                                continue
+
+                            for event in self._process_tool_call(repaired, sse):
+                                yield event
 
             except (asyncio.CancelledError, GeneratorExit):
                 raise
@@ -888,10 +970,10 @@ class OpenAIChatTransport(BaseProvider):
                 json.JSONDecodeError,
                 ValueError,
                 TypeError,
-            ) as e:
+            ) as parse_error:
                 logger.warning(
                     "STREAM_RECOVERABLE_PARSE_ERROR: {}",
-                    repr(e),
+                    repr(parse_error),
                 )
 
                 for event in sse.close_all_blocks():
@@ -909,12 +991,14 @@ class OpenAIChatTransport(BaseProvider):
                 yield sse.message_stop()
                 return
 
-            except Exception as e:
+            except Exception as stream_error:
                 logger.exception("STREAM_EXCEPTION")
-                self._log_stream_transport_error(tag, req_tag, e)
-                mapped_e = map_error(e, rate_limiter=self._global_rate_limiter)
+                self._log_stream_transport_error(tag, req_tag, stream_error)
+                mapped_error = map_error(
+                    stream_error, rate_limiter=self._global_rate_limiter
+                )
                 base_message = user_visible_message_for_mapped_provider_error(
-                    mapped_e,
+                    mapped_error,
                     provider_name=tag,
                     read_timeout_s=self._config.http_read_timeout,
                 )
@@ -922,7 +1006,7 @@ class OpenAIChatTransport(BaseProvider):
                 logger.info(
                     "{}_STREAM: Emitting SSE error event for {}{}",
                     tag,
-                    type(e).__name__,
+                    type(stream_error).__name__,
                     req_tag,
                 )
                 for event in sse.close_all_blocks():
@@ -1018,19 +1102,21 @@ class OpenAIChatTransport(BaseProvider):
             pending_tool_calls.clear()
 
         # ------------------------------------------------------------------
-        # Flush remaining think-parser content
+        # Flush remaining heuristic-parser and think-parser content
         # ------------------------------------------------------------------
+        heuristic_extra = heuristic_parser.flush()
+        if heuristic_extra:
+            synthetic_tool_calls.extend(heuristic_extra)
+
         remaining = think_parser.flush()
-        if remaining:
-            if remaining.type == ContentType.THINKING:
-                if thinking_enabled:
-                    for event in sse.ensure_thinking_block():
-                        yield event
-                    yield sse.emit_thinking_delta(remaining.content)
-            if remaining and remaining.type == ContentType.TEXT:
-                for event in sse.ensure_text_block():
-                    yield event
-                yield sse.emit_text_delta(remaining.content)
+        if remaining and remaining.type == ContentType.THINKING and thinking_enabled:
+            for event in sse.ensure_thinking_block():
+                yield event
+            yield sse.emit_thinking_delta(remaining.content)
+        elif remaining and remaining.type == ContentType.TEXT:
+            for event in sse.ensure_text_block():
+                yield event
+            yield sse.emit_text_delta(remaining.content)
             # Final emergency flush for pending tool calls
         if pending_tool_calls:
             logger.warning(
@@ -1127,10 +1213,16 @@ class OpenAIChatTransport(BaseProvider):
                     provider_input,
                     provider_input - input_tokens,
                 )
+        # Force correct stop reason if tools were emitted
+        has_started_tool = any(s.started for s in sse.blocks.tool_states.values())
         if not finish_reason:
-            logger.warning(
-                "STREAM_RECOVERY: missing finish_reason, forcing stop"
-            )
-            finish_reason = "stop"
+            if has_started_tool:
+                finish_reason = "tool_calls"
+            else:
+                logger.warning("STREAM_RECOVERY: missing finish_reason, forcing stop")
+                finish_reason = "stop"
+        elif finish_reason == "stop" and has_started_tool:
+            finish_reason = "tool_calls"
+
         yield sse.message_delta(map_stop_reason(finish_reason), output_tokens)
         yield sse.message_stop()

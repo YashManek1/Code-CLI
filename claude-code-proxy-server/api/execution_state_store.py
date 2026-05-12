@@ -16,7 +16,7 @@ import json
 import os
 import tempfile
 import threading
-from datetime import datetime, timezone
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -113,10 +113,7 @@ class ExecutionStateStore:
             if field_value is not None:
                 update_data[field_name] = field_value
 
-        if update_data:
-            updated = existing.model_copy(update=update_data)
-        else:
-            updated = existing
+        updated = existing.model_copy(update=update_data) if update_data else existing
 
         self.save(updated)
         return updated
@@ -162,6 +159,40 @@ class ExecutionStateStore:
             self.save(state)
         return state
 
+    def ensure_state_from_parent(
+        self, session_id: str, parent_session_id: str | None
+    ) -> ExecutionState:
+        """Load/create state, cloning parent orchestration state when needed.
+
+        Claude Code can intentionally regenerate the CLI session id when plan
+        mode exits with a context clear.  In that flow, the implementation
+        session should inherit the locked plan and checkpoint from the planning
+        session instead of starting from an empty orchestration state.
+        """
+        state = self.load(session_id)
+        if state is not None:
+            if parent_session_id and state.parent_session_id != parent_session_id:
+                state.parent_session_id = parent_session_id
+                self.save(state)
+            return state
+
+        parent = self.load(parent_session_id) if parent_session_id else None
+        if parent is not None:
+            state = parent.model_copy(
+                deep=True,
+                update={
+                    "session_id": session_id,
+                    "parent_session_id": parent_session_id,
+                },
+            )
+        else:
+            state = ExecutionState(
+                session_id=session_id,
+                parent_session_id=parent_session_id,
+            )
+        self.save(state)
+        return state
+
     def delete(self, session_id: str) -> bool:
         """Delete the state file for a session. Returns True if deleted."""
         path = self._file_path(session_id)
@@ -181,11 +212,8 @@ class ExecutionStateStore:
     def list_sessions(self) -> list[str]:
         """Return all session IDs with persisted state."""
         sessions: list[str] = []
-        try:
-            for path in self._base_dir.glob("*.json"):
-                sessions.append(path.stem)
-        except OSError:
-            pass
+        with suppress(OSError):
+            sessions.extend(path.stem for path in self._base_dir.glob("*.json"))
         return sessions
 
     # ------------------------------------------------------------------
@@ -216,8 +244,6 @@ class ExecutionStateStore:
             os.replace(tmp_path, str(path))
         except Exception:
             # Clean up temp file on failure
-            try:
+            with suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass
             raise

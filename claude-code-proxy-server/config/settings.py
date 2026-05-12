@@ -172,6 +172,15 @@ class Settings(BaseSettings):
     provider_max_concurrency: int = Field(
         default=5, validation_alias="PROVIDER_MAX_CONCURRENCY"
     )
+    nvidia_nim_rate_limit_headroom: int = Field(
+        default=10, validation_alias="NVIDIA_NIM_RATE_LIMIT_HEADROOM"
+    )
+    nvidia_nim_reasoning_budget: int | None = Field(
+        default=None, validation_alias="NVIDIA_NIM_REASONING_BUDGET"
+    )
+    enable_provider_model_discovery: bool = Field(
+        default=False, validation_alias="ENABLE_PROVIDER_MODEL_DISCOVERY"
+    )
     enable_model_thinking: bool = Field(
         default=True, validation_alias="ENABLE_MODEL_THINKING"
     )
@@ -196,6 +205,12 @@ class Settings(BaseSettings):
         default=HTTP_CONNECT_TIMEOUT_DEFAULT,
         validation_alias="HTTP_CONNECT_TIMEOUT",
     )
+    # Maximum time an upstream stream may go without a real provider chunk.
+    # The proxy may emit bounded SSE pings during this interval to keep clients
+    # connected, but it must eventually close the Anthropic stream contract.
+    provider_stream_idle_timeout: float = Field(
+        default=45.0, validation_alias="PROVIDER_STREAM_IDLE_TIMEOUT"
+    )
 
     # ==================== Fast Prefix Detection ====================
     fast_prefix_detection: bool = True
@@ -205,11 +220,22 @@ class Settings(BaseSettings):
     enable_title_generation_skip: bool = True
     enable_suggestion_mode_skip: bool = True
     enable_filepath_extraction_mock: bool = True
+    auto_disable_thinking_simple_prompts: bool = Field(
+        default=True, validation_alias="AUTO_DISABLE_THINKING_SIMPLE_PROMPTS"
+    )
+    enable_weak_model_quality_hints: bool = Field(
+        default=True, validation_alias="ENABLE_WEAK_MODEL_QUALITY_HINTS"
+    )
 
     # ==================== Local web server tools (web_search / web_fetch) ====================
     # Off by default: these tools perform outbound HTTP from the proxy (SSRF risk).
     enable_web_server_tools: bool = Field(
         default=False, validation_alias="ENABLE_WEB_SERVER_TOOLS"
+    )
+    # Experimental persistent orchestration state. Off by default so core chat
+    # request/stream lifecycle remains independent of state-sync features.
+    enable_execution_state_orchestration: bool = Field(
+        default=False, validation_alias="ENABLE_EXECUTION_STATE_ORCHESTRATION"
     )
     # Comma-separated URL schemes allowed for web_fetch (default: http,https).
     web_fetch_allowed_schemes: str = Field(
@@ -315,57 +341,94 @@ class Settings(BaseSettings):
         "enable_opus_thinking",
         "enable_sonnet_thinking",
         "enable_haiku_thinking",
+        "nvidia_nim_reasoning_budget",
         mode="before",
     )
     @classmethod
-    def parse_optional_str(cls, v: Any) -> Any:
-        if v == "":
+    def parse_optional_str(cls, value: Any) -> Any:
+        if value == "":
             return None
-        return v
+        return value
 
     @field_validator("max_message_log_entries_per_chat", mode="before")
     @classmethod
-    def parse_optional_log_cap(cls, v: Any) -> Any:
-        if v == "" or v is None:
+    def parse_optional_log_cap(cls, value: Any) -> Any:
+        if value == "" or value is None:
             return None
-        return v
+        return value
 
     @field_validator("whisper_device")
     @classmethod
-    def validate_whisper_device(cls, v: str) -> str:
-        if v not in ("cpu", "cuda", "nvidia_nim"):
+    def validate_whisper_device(cls, value: str) -> str:
+        if value not in ("cpu", "cuda", "nvidia_nim"):
             raise ValueError(
-                f"whisper_device must be 'cpu', 'cuda', or 'nvidia_nim', got {v!r}"
+                f"whisper_device must be 'cpu', 'cuda', or 'nvidia_nim', got {value!r}"
             )
-        return v
+        return value
 
     @field_validator("messaging_platform")
     @classmethod
-    def validate_messaging_platform(cls, v: str) -> str:
-        if v not in ("telegram", "discord", "none"):
+    def validate_messaging_platform(cls, value: str) -> str:
+        if value not in ("telegram", "discord", "none"):
             raise ValueError(
-                f"messaging_platform must be 'telegram', 'discord', or 'none', got {v!r}"
+                "messaging_platform must be 'telegram', 'discord', or 'none', "
+                f"got {value!r}"
             )
-        return v
+        return value
 
     @field_validator("messaging_rate_limit")
     @classmethod
-    def validate_messaging_rate_limit(cls, v: int) -> int:
-        if v <= 0:
+    def validate_messaging_rate_limit(cls, value: int) -> int:
+        if value <= 0:
             raise ValueError("messaging_rate_limit must be > 0")
-        return v
+        return value
 
     @field_validator("messaging_rate_window")
     @classmethod
-    def validate_messaging_rate_window(cls, v: float) -> float:
-        if v <= 0:
+    def validate_messaging_rate_window(cls, value: float) -> float:
+        if value <= 0:
             raise ValueError("messaging_rate_window must be > 0")
-        return float(v)
+        return float(value)
+
+    @field_validator("provider_rate_limit")
+    @classmethod
+    def validate_provider_rate_limit(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("provider_rate_limit must be > 0")
+        return value
+
+    @field_validator("provider_rate_window")
+    @classmethod
+    def validate_provider_rate_window(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("provider_rate_window must be > 0")
+        return value
+
+    @field_validator("provider_max_concurrency")
+    @classmethod
+    def validate_provider_max_concurrency(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("provider_max_concurrency must be > 0")
+        return value
+
+    @field_validator("provider_stream_idle_timeout")
+    @classmethod
+    def validate_provider_stream_idle_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("provider_stream_idle_timeout must be > 0")
+        return float(value)
+
+    @field_validator("nvidia_nim_rate_limit_headroom")
+    @classmethod
+    def validate_nvidia_nim_rate_limit_headroom(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("nvidia_nim_rate_limit_headroom must be >= 0")
+        return value
 
     @field_validator("web_fetch_allowed_schemes")
     @classmethod
-    def validate_web_fetch_allowed_schemes(cls, v: str) -> str:
-        schemes = [part.strip().lower() for part in v.split(",") if part.strip()]
+    def validate_web_fetch_allowed_schemes(cls, value: str) -> str:
+        schemes = [part.strip().lower() for part in value.split(",") if part.strip()]
         if not schemes:
             raise ValueError("web_fetch_allowed_schemes must list at least one scheme")
         for scheme in schemes:
@@ -377,30 +440,30 @@ class Settings(BaseSettings):
 
     @field_validator("ollama_base_url")
     @classmethod
-    def validate_ollama_base_url(cls, v: str) -> str:
-        if v.rstrip("/").endswith("/v1"):
+    def validate_ollama_base_url(cls, value: str) -> str:
+        if value.rstrip("/").endswith("/v1"):
             raise ValueError(
                 "OLLAMA_BASE_URL must be the Ollama root URL for native Anthropic "
                 "messages, e.g. http://localhost:11434 (without /v1)."
             )
-        return v
+        return value
 
     @field_validator("model", "model_opus", "model_sonnet", "model_haiku")
     @classmethod
-    def validate_model_format(cls, v: str | None) -> str | None:
-        if v is None:
+    def validate_model_format(cls, value: str | None) -> str | None:
+        if value is None:
             return None
-        if "/" not in v:
+        if "/" not in value:
             raise ValueError(
                 f"Model must be prefixed with provider type. "
                 f"Valid providers: {', '.join(SUPPORTED_PROVIDER_IDS)}. "
                 f"Format: provider_type/model/name"
             )
-        provider = v.split("/", 1)[0]
+        provider = value.split("/", 1)[0]
         if provider not in SUPPORTED_PROVIDER_IDS:
             supported = ", ".join(f"'{p}'" for p in SUPPORTED_PROVIDER_IDS)
             raise ValueError(f"Invalid provider: '{provider}'. Supported: {supported}")
-        return v
+        return value
 
     @model_validator(mode="after")
     def check_nvidia_nim_api_key(self) -> Settings:

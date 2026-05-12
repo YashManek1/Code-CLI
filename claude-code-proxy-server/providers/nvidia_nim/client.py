@@ -44,7 +44,10 @@ class NvidiaNimProvider(OpenAIChatTransport):
     def _get_retry_request_body(self, error: Exception, body: dict) -> dict | None:
         """Retry once with a downgraded body when NIM rejects a known field."""
         status_code = getattr(error, "status_code", None)
-        if not isinstance(error, openai.BadRequestError) and status_code != 400:
+        if not isinstance(error, openai.BadRequestError) and status_code not in (
+            400,
+            422,
+        ):
             return None
 
         error_text = str(error)
@@ -58,7 +61,8 @@ class NvidiaNimProvider(OpenAIChatTransport):
             if retry_body is None:
                 return None
             logger.warning(
-                "NIM_STREAM: retrying without reasoning_budget after 400 error"
+                "NIM_STREAM: retrying without reasoning_budget after {} error",
+                status_code or "unknown",
             )
             return retry_body
 
@@ -66,7 +70,10 @@ class NvidiaNimProvider(OpenAIChatTransport):
             retry_body = clone_body_without_chat_template(body)
             if retry_body is None:
                 return None
-            logger.warning("NIM_STREAM: retrying without chat_template after 400 error")
+            logger.warning(
+                "NIM_STREAM: retrying without chat_template after {} error",
+                status_code or "unknown",
+            )
             return retry_body
 
         if "reasoning_content" in error_text:
@@ -74,7 +81,8 @@ class NvidiaNimProvider(OpenAIChatTransport):
             if retry_body is None:
                 return None
             logger.warning(
-                "NIM_STREAM: retrying without reasoning_content after 400 error"
+                "NIM_STREAM: retrying without reasoning_content after {} error",
+                status_code or "unknown",
             )
             return retry_body
 

@@ -27,6 +27,8 @@ class TestSettings:
         monkeypatch.delenv("MODEL", raising=False)
         monkeypatch.delenv("HTTP_READ_TIMEOUT", raising=False)
         monkeypatch.delenv("HTTP_CONNECT_TIMEOUT", raising=False)
+        monkeypatch.delenv("PROVIDER_STREAM_IDLE_TIMEOUT", raising=False)
+        monkeypatch.delenv("ENABLE_EXECUTION_STATE_ORCHESTRATION", raising=False)
         monkeypatch.setitem(Settings.model_config, "env_file", ())
         settings = Settings()
         assert settings.model == "nvidia_nim/z-ai/glm4.7"
@@ -35,9 +37,11 @@ class TestSettings:
         assert isinstance(settings.nim.temperature, float)
         assert isinstance(settings.fast_prefix_detection, bool)
         assert isinstance(settings.enable_model_thinking, bool)
-        assert settings.http_read_timeout == 120.0
+        assert settings.http_read_timeout == 1800.0
         assert settings.http_connect_timeout == HTTP_CONNECT_TIMEOUT_DEFAULT
+        assert settings.provider_stream_idle_timeout == 45.0
         assert settings.enable_web_server_tools is False
+        assert settings.enable_execution_state_orchestration is False
         assert settings.log_raw_api_payloads is False
         assert settings.log_raw_sse_events is False
         assert settings.debug_platform_edits is False
@@ -114,6 +118,23 @@ class TestSettings:
         settings = Settings()
         assert settings.provider_rate_window == 30
 
+    def test_nvidia_nim_rate_limit_headroom_from_env(self, monkeypatch):
+        """NVIDIA_NIM_RATE_LIMIT_HEADROOM env var is loaded into settings."""
+        from config.settings import Settings
+
+        monkeypatch.setenv("NVIDIA_NIM_RATE_LIMIT_HEADROOM", "3")
+        settings = Settings()
+        assert settings.nvidia_nim_rate_limit_headroom == 3
+
+    def test_provider_model_discovery_disabled_by_default(self, monkeypatch):
+        """Provider model-list API calls are opt-in to reduce upstream requests."""
+        from config.settings import Settings
+
+        monkeypatch.delenv("ENABLE_PROVIDER_MODEL_DISCOVERY", raising=False)
+        monkeypatch.setitem(Settings.model_config, "env_file", ())
+        settings = Settings()
+        assert settings.enable_provider_model_discovery is False
+
     def test_http_read_timeout_from_env(self, monkeypatch):
         """HTTP_READ_TIMEOUT env var is loaded into settings."""
         from config.settings import Settings
@@ -148,7 +169,7 @@ class TestSettings:
         monkeypatch.setitem(Settings.model_config, "env_file", ())
         settings = Settings()
         assert settings.http_connect_timeout == HTTP_CONNECT_TIMEOUT_DEFAULT
-        assert HTTP_CONNECT_TIMEOUT_DEFAULT == 10.0
+        assert HTTP_CONNECT_TIMEOUT_DEFAULT == 60.0
 
     def test_enable_model_thinking_from_env(self, monkeypatch):
         """ENABLE_MODEL_THINKING env var is loaded into settings."""
@@ -169,6 +190,18 @@ class TestSettings:
         assert settings.enable_opus_thinking is True
         assert settings.enable_sonnet_thinking is False
         assert settings.enable_haiku_thinking is False
+
+    def test_nvidia_nim_reasoning_budget_is_opt_in(self, monkeypatch):
+        """NIM reasoning budget is unset by default and configurable via env."""
+        from config.settings import Settings
+
+        monkeypatch.delenv("NVIDIA_NIM_REASONING_BUDGET", raising=False)
+        settings = Settings()
+        assert settings.nvidia_nim_reasoning_budget is None
+
+        monkeypatch.setenv("NVIDIA_NIM_REASONING_BUDGET", "2048")
+        settings = Settings()
+        assert settings.nvidia_nim_reasoning_budget == 2048
 
     def test_empty_per_model_thinking_inherits_model_default(self, monkeypatch):
         """Blank per-model thinking env vars are treated as unset."""

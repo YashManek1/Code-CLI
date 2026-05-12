@@ -35,7 +35,12 @@ PROVIDER_DESCRIPTORS: dict[str, ProviderDescriptor] = PROVIDER_CATALOG
 def _create_nvidia_nim(config: ProviderConfig, settings: Settings) -> BaseProvider:
     from providers.nvidia_nim import NvidiaNimProvider
 
-    return NvidiaNimProvider(config, nim_settings=settings.nim)
+    nim_settings = settings.nim
+    if settings.nvidia_nim_reasoning_budget is not None:
+        nim_settings = nim_settings.model_copy(
+            update={"reasoning_budget": settings.nvidia_nim_reasoning_budget}
+        )
+    return NvidiaNimProvider(config, nim_settings=nim_settings)
 
 
 def _create_open_router(config: ProviderConfig, _settings: Settings) -> BaseProvider:
@@ -113,6 +118,17 @@ def _require_credential(descriptor: ProviderDescriptor, credential: str) -> None
     raise AuthenticationError(message)
 
 
+def _nvidia_nim_effective_rate_limit(settings: Settings) -> int:
+    """Return the NIM request limit with a small safety buffer below provider quota."""
+    configured_limit = getattr(settings, "provider_rate_limit", 40)
+    headroom = getattr(settings, "nvidia_nim_rate_limit_headroom", 10)
+    if not isinstance(configured_limit, int):
+        configured_limit = 40
+    if not isinstance(headroom, int):
+        headroom = 10
+    return max(1, configured_limit - headroom)
+
+
 def build_provider_config(
     descriptor: ProviderDescriptor, settings: Settings
 ) -> ProviderConfig:
@@ -122,15 +138,19 @@ def build_provider_config(
         settings, descriptor.base_url_attr, descriptor.default_base_url or ""
     )
     proxy = _string_attr(settings, descriptor.proxy_attr)
+    rate_limit = settings.provider_rate_limit
+    if descriptor.provider_id == "nvidia_nim":
+        rate_limit = _nvidia_nim_effective_rate_limit(settings)
     return ProviderConfig(
         api_key=credential,
         base_url=base_url or descriptor.default_base_url,
-        rate_limit=settings.provider_rate_limit,
+        rate_limit=rate_limit,
         rate_window=settings.provider_rate_window,
         max_concurrency=settings.provider_max_concurrency,
         http_read_timeout=settings.http_read_timeout,
         http_write_timeout=settings.http_write_timeout,
         http_connect_timeout=settings.http_connect_timeout,
+        stream_idle_timeout=getattr(settings, "provider_stream_idle_timeout", 45.0),
         enable_thinking=settings.enable_model_thinking,
         proxy=proxy,
         log_raw_sse_events=settings.log_raw_sse_events,
@@ -432,11 +452,11 @@ class ProviderRegistry:
         items = list(self._providers.items())
         errors: list[Exception] = []
         try:
-            for _pid, provider in items:
+            for _provider_id, provider in items:
                 try:
                     await provider.cleanup()
-                except Exception as e:
-                    errors.append(e)
+                except Exception as cleanup_error:
+                    errors.append(cleanup_error)
         finally:
             self._providers.clear()
             self._model_ids_by_provider.clear()

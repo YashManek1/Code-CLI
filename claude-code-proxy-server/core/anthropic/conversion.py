@@ -407,7 +407,7 @@ class AnthropicToOpenAIConverter:
 
         content_str = "\n\n".join(content_parts)
         if not content_str and not tool_calls:
-            content_str = ""
+            content_str = " "
 
         msg: dict[str, Any] = {
             "role": "assistant",
@@ -547,6 +547,7 @@ class AnthropicToOpenAIConverter:
     @staticmethod
     def _convert_user_message(content: list[Any]) -> list[dict[str, Any]]:
         text_parts: list[str] = []
+        saw_text_block = False
         tool_messages: list[dict[str, Any]] = []
         image_messages: list[dict[str, Any]] = []
 
@@ -554,6 +555,7 @@ class AnthropicToOpenAIConverter:
             block_type = get_block_type(block)
 
             if block_type == "text":
+                saw_text_block = True
                 text = get_block_attr(block, "text", "")
 
                 if text:
@@ -615,7 +617,7 @@ class AnthropicToOpenAIConverter:
 
         result: list[dict[str, Any]] = []
 
-        if text_parts:
+        if text_parts or saw_text_block:
             result.append(
                 {
                     "role": "user",
@@ -652,7 +654,9 @@ class AnthropicToOpenAIConverter:
             name = tool_choice.get("name")
             if name:
                 return {"type": "function", "function": {"name": name}}
-        if choice_type in {"any", "auto"}:
+        if choice_type == "any":
+            return "required"
+        if choice_type == "auto":
             return "auto"
         if choice_type in {"none", "required"}:
             return choice_type

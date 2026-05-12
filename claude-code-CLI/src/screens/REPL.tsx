@@ -3060,6 +3060,15 @@ export function REPL({
         if (oldPlanSlug) {
           setPlanSlug(getSessionId(), oldPlanSlug);
         }
+        if (initialMsg.message.planContent) {
+          const {
+            applyPlan,
+            isExecutionStateOrchestrationEnabled
+          } = await import('../orchestration/executionState.js');
+          if (isExecutionStateOrchestrationEnabled()) {
+            await applyPlan(initialMsg.message.planContent);
+          }
+        }
       }
 
       // Atomically: clear initial message, set permission mode and rules, and store plan for verification

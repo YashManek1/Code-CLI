@@ -8,7 +8,7 @@ injector, and the CLI sync layer.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal
 
@@ -41,7 +41,7 @@ class PlanStep(BaseModel):
         return self.model_copy(
             update={
                 "status": "completed",
-                "completed_at": datetime.now(timezone.utc),
+                "completed_at": datetime.now(UTC),
             }
         )
 
@@ -56,7 +56,7 @@ class CheckpointState(BaseModel):
     name: str
     description: str = ""
     phase: ExecutionPhase = ExecutionPhase.idle
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class ExecutionState(BaseModel):
@@ -68,6 +68,7 @@ class ExecutionState(BaseModel):
     """
 
     session_id: str
+    parent_session_id: str | None = None
     active_model: str = ""
     current_checkpoint: CheckpointState | None = None
     implementation_phase: ExecutionPhase = ExecutionPhase.idle
@@ -78,12 +79,13 @@ class ExecutionState(BaseModel):
     active_files: list[str] = Field(default_factory=list)
     architecture_sources: list[str] = Field(default_factory=list)
     validation_findings: list[str] = Field(default_factory=list)
-    last_updated: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    processed_tool_result_ids: list[str] = Field(default_factory=list)
+    last_updated: datetime = Field(default_factory=lambda: datetime.now(UTC))
     version: int = 1
 
     def touch(self) -> None:
         """Update the ``last_updated`` timestamp in place."""
-        self.last_updated = datetime.now(timezone.utc)
+        self.last_updated = datetime.now(UTC)
 
     def progress_summary(self) -> tuple[int, int]:
         """Return ``(completed_count, total_count)``."""
@@ -105,6 +107,7 @@ class ExecutionStateUpdate(BaseModel):
     """
 
     active_model: str | None = None
+    parent_session_id: str | None = None
     current_checkpoint: CheckpointState | None = None
     implementation_phase: ExecutionPhase | None = None
     approved_plan: str | None = None
@@ -114,3 +117,4 @@ class ExecutionStateUpdate(BaseModel):
     active_files: list[str] | None = None
     architecture_sources: list[str] | None = None
     validation_findings: list[str] | None = None
+    processed_tool_result_ids: list[str] | None = None

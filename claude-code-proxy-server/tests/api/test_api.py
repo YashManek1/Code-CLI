@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.app import create_app
+from api.execution_state_store import ExecutionStateStore
 from providers.nvidia_nim import NvidiaNimProvider
 
 app = create_app()
@@ -93,6 +94,26 @@ def test_create_message_stream(client: TestClient):
     assert "text/event-stream" in response.headers.get("content-type", "")
     content = b"".join(response.iter_bytes())
     assert b"message_start" in content or b"event:" in content
+
+
+def test_apply_plan_creates_execution_state(client: TestClient, tmp_path):
+    """Locking a plan should initialize state even before the first model call."""
+    client.app.state.execution_state_store = ExecutionStateStore(
+        base_dir=str(tmp_path / "states")
+    )
+    session_id = "route-lock-plan-session"
+    client.delete(f"/v1/execution_state/{session_id}")
+
+    response = client.post(
+        f"/v1/execution_state/{session_id}/apply_plan",
+        json={"plan_text": "# Plan\n- [ ] Wire lock-plan route"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "plan_applied"
+    assert data["session_id"] == session_id
+    assert data["remaining_steps"][0]["description"] == "Wire lock-plan route"
 
 
 def test_model_mapping(client: TestClient):

@@ -107,9 +107,21 @@ class AppRuntime:
         self.app.state.provider_registry = self._provider_registry
         try:
             warn_if_process_auth_token(self.settings)
-            await self._provider_registry.validate_configured_models(self.settings)
-            self._provider_registry.start_model_list_refresh(self.settings)
-            self._execution_state_store = ExecutionStateStore()
+            if self.settings.enable_provider_model_discovery:
+                await self._provider_registry.validate_configured_models(
+                    self.settings
+                )
+                self._provider_registry.start_model_list_refresh(self.settings)
+            else:
+                logger.info(
+                    "Provider model discovery disabled; using configured model refs only"
+                )
+            if getattr(self.settings, "enable_execution_state_orchestration", False):
+                self._execution_state_store = ExecutionStateStore()
+                logger.info("Execution-state orchestration enabled")
+            else:
+                self._execution_state_store = None
+                logger.info("Execution-state orchestration disabled")
             await self._start_messaging_if_configured()
             self._publish_state()
         except Exception as exc:
@@ -126,13 +138,13 @@ class AppRuntime:
         if self.message_handler is not None:
             try:
                 self.message_handler.session_store.flush_pending_save()
-            except Exception as e:
+            except Exception as flush_error:
                 if verbose:
-                    logger.warning("Session store flush on shutdown: {}", e)
+                    logger.warning("Session store flush on shutdown: {}", flush_error)
                 else:
                     logger.warning(
                         "Session store flush on shutdown: exc_type={}",
-                        type(e).__name__,
+                        type(flush_error).__name__,
                     )
 
         logger.info("Shutdown requested, cleaning up...")
@@ -176,6 +188,12 @@ class AppRuntime:
                     whisper_device=self.settings.whisper_device,
                     hf_token=self.settings.hf_token,
                     nvidia_nim_api_key=self.settings.nvidia_nim_api_key,
+                    provider_rate_limit=self.settings.provider_rate_limit,
+                    provider_rate_window=self.settings.provider_rate_window,
+                    provider_max_concurrency=self.settings.provider_max_concurrency,
+                    nvidia_nim_rate_limit_headroom=(
+                        self.settings.nvidia_nim_rate_limit_headroom
+                    ),
                     messaging_rate_limit=self.settings.messaging_rate_limit,
                     messaging_rate_window=self.settings.messaging_rate_window,
                     log_raw_messaging_content=self.settings.log_raw_messaging_content,
@@ -186,24 +204,24 @@ class AppRuntime:
             if self.messaging_platform:
                 await self._start_message_handler()
 
-        except ImportError as e:
+        except ImportError as import_error:
             if self.settings.log_api_error_tracebacks:
-                logger.warning("Messaging module import error: {}", e)
+                logger.warning("Messaging module import error: {}", import_error)
             else:
                 logger.warning(
                     "Messaging module import error: exc_type={}",
-                    type(e).__name__,
+                    type(import_error).__name__,
                 )
-        except Exception as e:
+        except Exception as startup_error:
             if self.settings.log_api_error_tracebacks:
-                logger.error("Failed to start messaging platform: {}", e)
+                logger.error("Failed to start messaging platform: {}", startup_error)
                 import traceback
 
                 logger.error(traceback.format_exc())
             else:
                 logger.error(
                     "Failed to start messaging platform: exc_type={}",
-                    type(e).__name__,
+                    type(startup_error).__name__,
                 )
 
     async def _start_message_handler(self) -> None:
@@ -295,17 +313,17 @@ class AppRuntime:
         verbose = self.settings.log_api_error_tracebacks
         try:
             from messaging.limiter import MessagingRateLimiter
-        except Exception as e:
+        except Exception as import_error:
             if verbose:
                 logger.debug(
                     "Rate limiter shutdown skipped (import failed): {}: {}",
-                    type(e).__name__,
-                    e,
+                    type(import_error).__name__,
+                    import_error,
                 )
             else:
                 logger.debug(
                     "Rate limiter shutdown skipped (import failed): exc_type={}",
-                    type(e).__name__,
+                    type(import_error).__name__,
                 )
             return
 

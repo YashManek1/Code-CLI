@@ -525,6 +525,22 @@ def test_heuristic_tool_parser_kimi_wrapped_call():
     assert tools[0]["input"] == {"pattern": "backend/tests"}
 
 
+def test_heuristic_tool_parser_kimi_function_indexed_call_preserves_prose():
+    parser = HeuristicToolParser(model="moonshotai/kimi-k2-instruct")
+    text = (
+        "Now let me read the test file "
+        'functions.Read:0{"file_path":"backend/tests/test_audio_processor.py"}'
+    )
+    filtered, tools = parser.feed(text)
+    tools.extend(parser.flush())
+
+    assert "Now let me read the test file" in filtered
+    assert "functions.Read" not in filtered
+    assert len(tools) == 1
+    assert tools[0]["name"] == "Read"
+    assert tools[0]["input"]["file_path"] == "backend/tests/test_audio_processor.py"
+
+
 def test_heuristic_tool_parser_kimi_leaking_token():
     parser = HeuristicToolParser(model="moonshotai/kimi-k2-instruct")
     # Simulation of leaking control token + JSON in content

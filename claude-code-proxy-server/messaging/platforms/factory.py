@@ -28,6 +28,10 @@ class MessagingPlatformOptions:
     whisper_device: str = "cpu"
     hf_token: str = ""
     nvidia_nim_api_key: str = ""
+    provider_rate_limit: int = 40
+    provider_rate_window: int = 60
+    provider_max_concurrency: int = 5
+    nvidia_nim_rate_limit_headroom: int = 10
     messaging_rate_limit: int = 1
     messaging_rate_window: float = 1.0
     log_raw_messaging_content: bool = False
@@ -68,6 +72,10 @@ def create_messaging_platform(
             whisper_device=opts.whisper_device,
             hf_token=opts.hf_token,
             nvidia_nim_api_key=opts.nvidia_nim_api_key,
+            provider_rate_limit=opts.provider_rate_limit,
+            provider_rate_window=opts.provider_rate_window,
+            provider_max_concurrency=opts.provider_max_concurrency,
+            nvidia_nim_rate_limit_headroom=opts.nvidia_nim_rate_limit_headroom,
             messaging_rate_limit=opts.messaging_rate_limit,
             messaging_rate_window=opts.messaging_rate_window,
             log_raw_messaging_content=opts.log_raw_messaging_content,
@@ -90,6 +98,10 @@ def create_messaging_platform(
             whisper_device=opts.whisper_device,
             hf_token=opts.hf_token,
             nvidia_nim_api_key=opts.nvidia_nim_api_key,
+            provider_rate_limit=opts.provider_rate_limit,
+            provider_rate_window=opts.provider_rate_window,
+            provider_max_concurrency=opts.provider_max_concurrency,
+            nvidia_nim_rate_limit_headroom=opts.nvidia_nim_rate_limit_headroom,
             messaging_rate_limit=opts.messaging_rate_limit,
             messaging_rate_window=opts.messaging_rate_window,
             log_raw_messaging_content=opts.log_raw_messaging_content,

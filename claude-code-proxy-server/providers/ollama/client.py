@@ -19,13 +19,18 @@ class OllamaProvider(AnthropicMessagesTransport):
         )
         self._api_key = config.api_key or "ollama"
 
-    async def _send_stream_request(self, body: dict) -> httpx.Response:
+    async def _send_stream_request(
+        self, body: dict, extra_headers: dict[str, str] | None = None
+    ) -> httpx.Response:
         """Create a streaming native Anthropic messages response."""
+        headers = self._request_headers()
+        if extra_headers:
+            headers.update(extra_headers)
         request = self._client.build_request(
             "POST",
             "/v1/messages",
             json=body,
-            headers=self._request_headers(),
+            headers=headers,
         )
         return await self._client.send(request, stream=True)
 

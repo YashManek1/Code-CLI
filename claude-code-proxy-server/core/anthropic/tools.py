@@ -1,11 +1,11 @@
 """Heuristic parser for text-emitted tool calls + JSON repair utilities.
 
 Enhancements over the original:
-- ``repair_tool_arguments`` – salvages malformed JSON from weak models (MiniMax, etc.)
+- ``repair_tool_arguments`` - salvages malformed JSON from weak models (MiniMax, etc.)
   using a multi-strategy cascade: clean → partial-parse → regex extraction → ``{}``
-- ``flatten_tool_schema`` – strips $defs / $ref nesting so models with limited schema
+- ``flatten_tool_schema`` - strips $defs / $ref nesting so models with limited schema
   comprehension (MiniMax m2.7) don't produce broken nested-JSON tool calls.
-- ``MODEL_QUIRKS`` registry – per-model flags consumed by the transport layer.
+- ``MODEL_QUIRKS`` registry - per-model flags consumed by the transport layer.
 - ``HeuristicToolParser`` extended with better control-token stripping and a
   JSON-in-text detector that handles MiniMax's inline-JSON emission style.
 
@@ -37,11 +37,11 @@ class ModelQuirks:
     """Capability/limitation flags for a specific model string."""
 
     __slots__ = (
-        "requires_json_repair",
+        "buffer_tool_calls",  # accumulate all chunks before emitting
         "flatten_tool_schemas",
         "max_schema_depth",
-        "buffer_tool_calls",  # accumulate all chunks before emitting
         "max_tool_tokens",  # hard cap on argument JSON length (chars)
+        "requires_json_repair",
         "strip_think_tags",
     )
 
@@ -84,7 +84,7 @@ _QUIRK_PATTERNS: list[tuple[str, ModelQuirks]] = [
         ModelQuirks(
             requires_json_repair=True,
             flatten_tool_schemas=True,
-            buffer_tool_calls=True,
+            buffer_tool_calls=False,
             max_tool_tokens=64_000,
             strip_think_tags=True,
         ),
@@ -93,6 +93,11 @@ _QUIRK_PATTERNS: list[tuple[str, ModelQuirks]] = [
 _DEFAULT_QUIRKS = ModelQuirks()
 
 # Matches Moonshot-style wrapped tool calls: <|tool_call_name_begin|>...<|tool_call_name_end|>...
+_KIMI_FUNCTION_INDEXED_RE = re.compile(
+    r"functions\.(?P<name>\w+):(?P<index>\d+)(?P<args>\{.*?\})",
+    re.DOTALL,
+)
+
 _KIMI_NAMED_TOOL_RE = re.compile(
     r"(?:lob:\d+)?<\|tool_call_name_begin\|>(?P<name>[^<]+)<\|tool_call_name_end\|>"
     r"\s*(?:lob:\d+)?<\|tool_call_argument_begin\|>(?P<args>\{.*?\})(?:<\|tool_call_argument_end\|>|$)",
@@ -174,8 +179,7 @@ def _close_open_json(s: str) -> str:
 
     if in_string:
         result.append('"')
-    for closer in reversed(stack):
-        result.append(closer)
+    result.extend(reversed(stack))
 
     return "".join(result)
 
@@ -188,7 +192,7 @@ def repair_tool_arguments(raw: str, *, tool_name: str = "", model: str = "") -> 
     2. Fix Python literals (True→true etc.), retry.
     3. Extract outermost ``{…}`` substring, retry.
     4. Close unclosed braces/strings, retry.
-    5. Regex-harvest key–value pairs from the raw text.
+    5. Regex-harvest key-value pairs from the raw text.
     6. Return ``{}`` as last resort so Claude Code doesn't crash.
     """
     if not raw or not raw.strip():
@@ -238,7 +242,7 @@ def repair_tool_arguments(raw: str, *, tool_name: str = "", model: str = "") -> 
     except json.JSONDecodeError:
         pass
 
-    # Step 5: regex harvest – grab "key": value pairs
+    # Step 5: regex harvest - grab "key": value pairs
     harvested: dict[str, Any] = {}
     for m in re.finditer(
         r'"([^"]+)"\s*:\s*("(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)',
@@ -314,7 +318,7 @@ def flatten_tool_schema(
                 continue
             if k == "properties":
                 if depth >= max_depth:
-                    # Too deep – collapse to plain object
+                    # Too deep - collapse to plain object
                     out["type"] = "object"
                     continue
                 out[k] = {pk: _flatten(pv, depth + 1) for pk, pv in v.items()}
@@ -579,6 +583,45 @@ class HeuristicToolParser:
 
         return remainder, detected
 
+    def _extract_kimi_function_indexed_calls(self) -> tuple[str, list[dict[str, Any]]]:
+        """Detect Kimi-style functions.Name:0{...} calls."""
+        detected: list[dict[str, Any]] = []
+        remainder = self._buffer
+        consumed_spans: list[tuple[int, int]] = []
+
+        for match in _KIMI_FUNCTION_INDEXED_RE.finditer(remainder):
+            tool_name = match.group("name")
+            raw_args = match.group("args")
+
+            try:
+                tool_input = json.loads(raw_args)
+            except json.JSONDecodeError:
+                repaired = repair_tool_arguments(
+                    raw_args, tool_name=tool_name, model=self._model
+                )
+                try:
+                    tool_input = json.loads(repaired)
+                except json.JSONDecodeError:
+                    tool_input = {}
+
+            detected.append(
+                {
+                    "type": "tool_use",
+                    "id": f"toolu_heuristic_{uuid.uuid4().hex[:8]}",
+                    "name": tool_name,
+                    "input": tool_input,
+                }
+            )
+            consumed_spans.append((match.start(), match.end()))
+            logger.debug(
+                "Heuristic bypass (Kimi indexed): Detected tool call '{}'", tool_name
+            )
+
+        for start, end in reversed(consumed_spans):
+            remainder = remainder[:start] + remainder[end:]
+
+        return remainder, detected
+
     def _extract_kimi_named_calls(self) -> tuple[str, list[dict[str, Any]]]:
         """Detect Moonshot-style <|tool_call_name_begin|>... calls."""
         detected: list[dict[str, Any]] = []
@@ -662,13 +705,15 @@ class HeuristicToolParser:
 
         # MiniMax/Kimi inline named-tool detection (runs before standard patterns)
         if (
-            self._quirks.requires_json_repair 
+            self._quirks.requires_json_repair
             or "minimax" in self._model.lower()
             or "kimi" in self._model.lower()
         ):
             self._buffer, extra = self._extract_minimax_named_calls()
             detected_tools.extend(extra)
             self._buffer, extra = self._extract_kimi_named_calls()
+            detected_tools.extend(extra)
+            self._buffer, extra = self._extract_kimi_function_indexed_calls()
             detected_tools.extend(extra)
 
         # Strip control tokens AFTER trying to extract wrapped tool calls

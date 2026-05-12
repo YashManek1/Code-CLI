@@ -4,6 +4,7 @@ Maintains the execution progress within a session by moving steps
 between the ``remaining_steps`` and ``completed_steps`` lists in the
 persistent ExecutionState.
 """
+
 from __future__ import annotations
 
 from loguru import logger
@@ -15,6 +16,7 @@ from .plan_parser import (
     parse_plan_text,
     split_by_status,
 )
+
 
 class ExecutionTracker:
     """Stateless tracker that operates on the persistent store."""
@@ -92,12 +94,16 @@ class ExecutionTracker:
         self,
         session_id: str,
         plan_text: str,
-    ) -> ExecutionState | None:
-        """Parse and persist an approved execution plan."""
-        state = self._store.load(session_id)
+        parent_session_id: str | None = None,
+    ) -> ExecutionState:
+        """Parse and persist an approved execution plan.
 
-        if state is None:
-            return None
+        Locking a plan is also the canonical session initialization point for
+        orchestration state.  The CLI may invoke ``/lock-plan`` before any model
+        request has created state, so this must create durable state on demand
+        instead of depending on an earlier in-memory/session side effect.
+        """
+        state = self._store.ensure_state_from_parent(session_id, parent_session_id)
 
         parsed_steps = parse_plan_text(plan_text)
 

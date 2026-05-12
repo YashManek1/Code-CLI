@@ -1,0 +1,24 @@
+{
+  "session_id": "route-lock-plan-session",
+  "parent_session_id": null,
+  "active_model": "",
+  "current_checkpoint": null,
+  "implementation_phase": "idle",
+  "approved_plan": "# Plan\n- [ ] Wire lock-plan route",
+  "completed_steps": [],
+  "remaining_steps": [
+    {
+      "step_id": "cccb6218498a",
+      "description": "Wire lock-plan route",
+      "status": "pending",
+      "completed_at": null
+    }
+  ],
+  "locked_rules": [],
+  "active_files": [],
+  "architecture_sources": [],
+  "validation_findings": [],
+  "processed_tool_result_ids": [],
+  "last_updated": "2026-05-11T16:10:32.627906Z",
+  "version": 1
+}

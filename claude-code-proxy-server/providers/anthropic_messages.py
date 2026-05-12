@@ -77,7 +77,17 @@ class AnthropicMessagesTransport(BaseProvider):
                 connect=config.http_connect_timeout,
                 read=config.http_read_timeout,
                 write=config.http_write_timeout,
+                pool=300.0,
             ),
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=120,
+            ),
+            headers={
+                "Accept-Encoding": "gzip",
+                "Connection": "keep-alive",
+            },
         )
 
     async def cleanup(self) -> None:
@@ -144,11 +154,14 @@ class AnthropicMessagesTransport(BaseProvider):
         self, body: dict, extra_headers: dict[str, str] | None = None
     ) -> httpx.Response:
         """Create a streaming messages response."""
+        headers = self._request_headers()
+        if extra_headers:
+            headers.update(extra_headers)
         request = self._client.build_request(
             "POST",
             "/messages",
             json=body,
-            headers=self._request_headers(extra_headers),
+            headers=headers,
         )
         return await self._client.send(request, stream=True)
 
