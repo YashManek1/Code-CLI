@@ -4,6 +4,8 @@ Discord Platform Adapter
 Implements MessagingPlatform for Discord using discord.py.
 """
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import tempfile
@@ -96,6 +98,10 @@ class DiscordPlatform(MessagingPlatform):
         whisper_device: str = "cpu",
         hf_token: str = "",
         nvidia_nim_api_key: str = "",
+        provider_rate_limit: int = 40,
+        provider_rate_window: int = 60,
+        provider_max_concurrency: int = 5,
+        nvidia_nim_rate_limit_headroom: int = 10,
         messaging_rate_limit: int = 1,
         messaging_rate_window: float = 1.0,
         log_raw_messaging_content: bool = False,
@@ -128,6 +134,10 @@ class DiscordPlatform(MessagingPlatform):
         self._voice_transcription = VoiceTranscriptionService(
             hf_token=hf_token,
             nvidia_nim_api_key=nvidia_nim_api_key,
+            provider_rate_limit=provider_rate_limit,
+            provider_rate_window=provider_rate_window,
+            provider_max_concurrency=provider_max_concurrency,
+            nvidia_nim_rate_limit_headroom=nvidia_nim_rate_limit_headroom,
         )
         self._voice_note_enabled = voice_note_enabled
         self._whisper_model = whisper_model
@@ -401,7 +411,7 @@ class DiscordPlatform(MessagingPlatform):
         if self._start_task and not self._start_task.done():
             try:
                 await asyncio.wait_for(self._start_task, timeout=5.0)
-            except TimeoutError, asyncio.CancelledError:
+            except (TimeoutError, asyncio.CancelledError):
                 self._start_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._start_task
@@ -474,7 +484,7 @@ class DiscordPlatform(MessagingPlatform):
         try:
             msg = await channel.fetch_message(int(message_id))
             await msg.delete()
-        except discord.NotFound, discord.Forbidden:
+        except (discord.NotFound, discord.Forbidden):
             pass
 
     async def delete_messages(self, chat_id: str, message_ids: list[str]) -> None:

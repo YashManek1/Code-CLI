@@ -68,6 +68,10 @@ class TelegramPlatform(MessagingPlatform):
         whisper_device: str = "cpu",
         hf_token: str = "",
         nvidia_nim_api_key: str = "",
+        provider_rate_limit: int = 40,
+        provider_rate_window: int = 60,
+        provider_max_concurrency: int = 5,
+        nvidia_nim_rate_limit_headroom: int = 10,
         messaging_rate_limit: int = 1,
         messaging_rate_window: float = 1.0,
         log_raw_messaging_content: bool = False,
@@ -97,6 +101,10 @@ class TelegramPlatform(MessagingPlatform):
         self._voice_transcription = VoiceTranscriptionService(
             hf_token=hf_token,
             nvidia_nim_api_key=nvidia_nim_api_key,
+            provider_rate_limit=provider_rate_limit,
+            provider_rate_window=provider_rate_window,
+            provider_max_concurrency=provider_max_concurrency,
+            nvidia_nim_rate_limit_headroom=nvidia_nim_rate_limit_headroom,
         )
         self._voice_note_enabled = voice_note_enabled
         self._whisper_model = whisper_model

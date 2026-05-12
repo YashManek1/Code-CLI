@@ -25,6 +25,7 @@ class ProviderConfig(BaseModel):
     http_read_timeout: float = 3600.0
     http_write_timeout: float = 300.0
     http_connect_timeout: float = HTTP_CONNECT_TIMEOUT_DEFAULT
+    stream_idle_timeout: float = 45.0
     enable_thinking: bool = True
     proxy: str = ""
     log_raw_sse_events: bool = False

@@ -104,8 +104,8 @@ def create_app(*, lifespan_enabled: bool = True) -> FastAPI:
         body: Any
         try:
             body = await request.json()
-        except Exception as e:
-            body = {"_json_error": type(e).__name__}
+        except Exception as json_error:
+            body = {"_json_error": type(json_error).__name__}
 
         message_summary, tool_names = summarize_request_validation_body(body)
 

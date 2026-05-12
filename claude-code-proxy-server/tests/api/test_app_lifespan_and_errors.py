@@ -18,6 +18,10 @@ _RUNTIME_EXTRAS = {
     "whisper_device": "cpu",
     "hf_token": "",
     "nvidia_nim_api_key": "",
+    "provider_rate_limit": 40,
+    "provider_rate_window": 60,
+    "provider_max_concurrency": 5,
+    "nvidia_nim_rate_limit_headroom": 10,
     "claude_cli_bin": "claude",
     "uses_process_anthropic_auth_token": lambda: False,
     "messaging_rate_limit": 1,
@@ -25,6 +29,7 @@ _RUNTIME_EXTRAS = {
     "max_message_log_entries_per_chat": None,
     "debug_platform_edits": False,
     "debug_subagent_stack": False,
+    "enable_provider_model_discovery": False,
     "log_api_error_tracebacks": False,
     "log_raw_messaging_content": False,
     "log_raw_cli_diagnostics": False,
@@ -237,6 +242,7 @@ def test_app_lifespan_sets_state_and_cleans_up(tmp_path, messaging_enabled):
         host="127.0.0.1",
         port=8082,
         log_file=str(tmp_path / "server.log"),
+        enable_provider_model_discovery=True,
     )
 
     fake_platform = MagicMock()
@@ -316,6 +322,7 @@ def test_app_lifespan_cleanup_continues_if_platform_stop_raises(tmp_path):
         host="127.0.0.1",
         port=8082,
         log_file=str(tmp_path / "server.log"),
+        enable_provider_model_discovery=True,
     )
 
     fake_platform = MagicMock()
@@ -367,6 +374,7 @@ async def test_runtime_startup_validation_blocks_messaging_and_cleans_up(tmp_pat
         host="127.0.0.1",
         port=8082,
         log_file=str(tmp_path / "server.log"),
+        enable_provider_model_discovery=True,
     )
     app = FastAPI()
     runtime = api_runtime_mod.AppRuntime(
@@ -413,6 +421,7 @@ async def test_graceful_asgi_lifespan_failure_sends_no_traceback(tmp_path):
         host="127.0.0.1",
         port=8082,
         log_file=str(tmp_path / "server.log"),
+        enable_provider_model_discovery=True,
     )
     app = api_app_mod.GracefulLifespanApp(FastAPI())
     sent: list[MutableMapping[str, Any]] = []

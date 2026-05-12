@@ -6,8 +6,10 @@
  */
 
 import { E_TOOL_USE_SUMMARY_GENERATION_FAILED } from '../../constants/errorIds.js'
+import { isEnvTruthy } from '../../utils/envUtils.js'
 import { toError } from '../../utils/errors.js'
 import { logError } from '../../utils/log.js'
+import { getAPIProvider, isFirstPartyAnthropicBaseUrl } from '../../utils/model/providers.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { asSystemPrompt } from '../../utils/systemPromptType.js'
 import { queryHaiku } from '../api/claude.js'
@@ -24,16 +26,16 @@ Examples:
 - Ran failing tests`
 
 type ToolInfo = {
-  name: string
-  input: unknown
-  output: unknown
+	name: string
+	input: unknown
+	output: unknown
 }
 
 export type GenerateToolUseSummaryParams = {
-  tools: ToolInfo[]
-  signal: AbortSignal
-  isNonInteractiveSession: boolean
-  lastAssistantText?: string
+	tools: ToolInfo[]
+	signal: AbortSignal
+	isNonInteractiveSession: boolean
+	lastAssistantText?: string
 }
 
 /**
@@ -43,71 +45,77 @@ export type GenerateToolUseSummaryParams = {
  * @returns A brief summary string, or null if generation fails
  */
 export async function generateToolUseSummary({
-  tools,
-  signal,
-  isNonInteractiveSession,
-  lastAssistantText,
+	tools,
+	signal,
+	isNonInteractiveSession,
+	lastAssistantText,
 }: GenerateToolUseSummaryParams): Promise<string | null> {
-  if (tools.length === 0) {
-    return null
-  }
+	if (tools.length === 0) {
+		return null
+	}
+	if (
+		getAPIProvider() === 'firstParty' &&
+		!isFirstPartyAnthropicBaseUrl() &&
+		!isEnvTruthy(process.env.CLAUDE_CODE_ENABLE_PROXY_BACKGROUND_SUMMARIES)
+	) {
+		return null
+	}
 
-  try {
-    // Build a concise representation of what tools did
-    const toolSummaries = tools
-      .map(tool => {
-        const inputStr = truncateJson(tool.input, 300)
-        const outputStr = truncateJson(tool.output, 300)
-        return `Tool: ${tool.name}\nInput: ${inputStr}\nOutput: ${outputStr}`
-      })
-      .join('\n\n')
+	try {
+		// Build a concise representation of what tools did
+		const toolSummaries = tools
+			.map((tool) => {
+				const inputStr = truncateJson(tool.input, 300)
+				const outputStr = truncateJson(tool.output, 300)
+				return `Tool: ${tool.name}\nInput: ${inputStr}\nOutput: ${outputStr}`
+			})
+			.join('\n\n')
 
-    const contextPrefix = lastAssistantText
-      ? `User's intent (from assistant's last message): ${lastAssistantText.slice(0, 200)}\n\n`
-      : ''
+		const contextPrefix = lastAssistantText
+			? `User's intent (from assistant's last message): ${lastAssistantText.slice(0, 200)}\n\n`
+			: ''
 
-    const response = await queryHaiku({
-      systemPrompt: asSystemPrompt([TOOL_USE_SUMMARY_SYSTEM_PROMPT]),
-      userPrompt: `${contextPrefix}Tools completed:\n\n${toolSummaries}\n\nLabel:`,
-      signal,
-      options: {
-        querySource: 'tool_use_summary_generation',
-        enablePromptCaching: true,
-        agents: [],
-        isNonInteractiveSession,
-        hasAppendSystemPrompt: false,
-        mcpTools: [],
-      },
-    })
+		const response = await queryHaiku({
+			systemPrompt: asSystemPrompt([TOOL_USE_SUMMARY_SYSTEM_PROMPT]),
+			userPrompt: `${contextPrefix}Tools completed:\n\n${toolSummaries}\n\nLabel:`,
+			signal,
+			options: {
+				querySource: 'tool_use_summary_generation',
+				enablePromptCaching: true,
+				agents: [],
+				isNonInteractiveSession,
+				hasAppendSystemPrompt: false,
+				mcpTools: [],
+			},
+		})
 
-    const summary = response.message.content
-      .filter(block => block.type === 'text')
-      .map(block => (block.type === 'text' ? block.text : ''))
-      .join('')
-      .trim()
+		const summary = response.message.content
+			.filter((block) => block.type === 'text')
+			.map((block) => (block.type === 'text' ? block.text : ''))
+			.join('')
+			.trim()
 
-    return summary || null
-  } catch (error) {
-    // Log but don't fail - summaries are non-critical
-    const err = toError(error)
-    err.cause = { errorId: E_TOOL_USE_SUMMARY_GENERATION_FAILED }
-    logError(err)
-    return null
-  }
+		return summary || null
+	} catch (error) {
+		// Log but don't fail - summaries are non-critical
+		const err = toError(error)
+		err.cause = { errorId: E_TOOL_USE_SUMMARY_GENERATION_FAILED }
+		logError(err)
+		return null
+	}
 }
 
 /**
  * Truncates a JSON value to a maximum length for the prompt.
  */
 function truncateJson(value: unknown, maxLength: number): string {
-  try {
-    const str = jsonStringify(value)
-    if (str.length <= maxLength) {
-      return str
-    }
-    return str.slice(0, maxLength - 3) + '...'
-  } catch {
-    return '[unable to serialize]'
-  }
+	try {
+		const str = jsonStringify(value)
+		if (str.length <= maxLength) {
+			return str
+		}
+		return `${str.slice(0, maxLength - 3)}...`
+	} catch {
+		return '[unable to serialize]'
+	}
 }
-

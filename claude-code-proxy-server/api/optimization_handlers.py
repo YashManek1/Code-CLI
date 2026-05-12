@@ -5,19 +5,18 @@ optimization is enabled, otherwise None.
 
 MiniMax / weak-model additions
 -------------------------------
-- ``try_minimax_tool_guard`` – intercepts requests whose tool-call content
+- ``try_minimax_tool_guard`` - intercepts requests whose tool-call content
   would produce argument JSON larger than the model's ``max_tool_tokens`` cap
   *before* the request leaves the proxy.  This prevents upstream timeouts and
   silent truncation when MiniMax tries to emit a 50 KB Terraform file in a
   single Write tool call.
-- ``try_large_write_split_hint`` – detects oversized ``content`` fields in
+- ``try_large_write_split_hint`` - detects oversized ``content`` fields in
   FileWrite / Write tool results and injects an assistant text nudge asking
   the model to split the operation.  Keeps Claude Code's retry loop clean.
 """
 
 from __future__ import annotations
 
-import json
 import uuid
 
 from loguru import logger
@@ -36,10 +35,10 @@ from .models.anthropic import MessagesRequest
 from .models.responses import MessagesResponse, Usage
 
 
-# Lazy import – avoids circular dep at module init time
+# Lazy import - avoids circular dep at module init time.
 def _get_quirks(model: str):  # type: ignore[return]
     try:
-        from core.anthropic.tools import get_model_quirks  # noqa: PLC0415
+        from core.anthropic.tools import get_model_quirks
 
         return get_model_quirks(model)
     except ImportError:
@@ -75,7 +74,7 @@ def _text_response(
 def try_prefix_detection(
     request_data: MessagesRequest, settings: Settings
 ) -> MessagesResponse | None:
-    """Fast prefix detection – return command prefix without API call."""
+    """Fast prefix detection - return command prefix without API call."""
     if not settings.fast_prefix_detection:
         return None
     is_prefix_req, command = is_prefix_detection_request(request_data)
@@ -147,10 +146,12 @@ def try_filepath_mock(
     """Mock filepath extraction requests."""
     if not settings.enable_filepath_extraction_mock:
         return None
-    is_fp, cmd, output = is_filepath_extraction_request(request_data)
-    if not is_fp:
+    is_filepath_request, command, command_output = is_filepath_extraction_request(
+        request_data
+    )
+    if not is_filepath_request:
         return None
-    filepaths = extract_filepaths_from_command(cmd, output)
+    filepaths = extract_filepaths_from_command(command, command_output)
     logger.info("Optimization: Mocked filepath extraction")
     return _text_response(
         request_data,
@@ -174,10 +175,10 @@ def _extract_tool_result_content(messages: list) -> list[tuple[str, str, int]]:
     results: list[tuple[str, str, int]] = []
     if not messages:
         return results
-    last_msg = messages[-1]
-    if not isinstance(last_msg, dict) or last_msg.get("role") != "user":
+    last_message = messages[-1]
+    if not isinstance(last_message, dict) or last_message.get("role") != "user":
         return results
-    content = last_msg.get("content", [])
+    content = last_message.get("content", [])
     if not isinstance(content, list):
         return results
     for block in content:
@@ -185,15 +186,22 @@ def _extract_tool_result_content(messages: list) -> list[tuple[str, str, int]]:
             continue
         if block.get("type") != "tool_result":
             continue
-        inner = block.get("content", "")
-        if isinstance(inner, list):
-            inner = " ".join(p.get("text", "") for p in inner if isinstance(p, dict))
-        results.append((block.get("tool_use_id", "?"), str(inner), len(str(inner))))
+        tool_result_content = block.get("content", "")
+        if isinstance(tool_result_content, list):
+            tool_result_content = " ".join(
+                part.get("text", "")
+                for part in tool_result_content
+                if isinstance(part, dict)
+            )
+        tool_result_text = str(tool_result_content)
+        results.append(
+            (block.get("tool_use_id", "?"), tool_result_text, len(tool_result_text))
+        )
     return results
 
 
 def try_minimax_tool_guard(
-    request_data: MessagesRequest, settings: Settings
+    request_data: MessagesRequest, _settings: Settings
 ) -> MessagesResponse | None:
     """Reject requests where any pending tool result exceeds the model's cap.
 
@@ -211,17 +219,20 @@ def try_minimax_tool_guard(
 
     # Convert Pydantic models / dicts uniformly
     raw_messages: list[dict] = []
-    for m in messages:
-        if isinstance(m, dict):
-            raw_messages.append(m)
-        elif hasattr(m, "model_dump"):
-            raw_messages.append(m.model_dump())
+    for message in messages:
+        if isinstance(message, dict):
+            raw_messages.append(message)
+        elif hasattr(message, "model_dump"):
+            raw_messages.append(message.model_dump())
         else:
             raw_messages.append(
-                {"role": getattr(m, "role", ""), "content": getattr(m, "content", "")}
+                {
+                    "role": getattr(message, "role", ""),
+                    "content": getattr(message, "content", ""),
+                }
             )
 
-    for tool_id, content, char_len in _extract_tool_result_content(raw_messages):
+    for tool_id, _content, char_len in _extract_tool_result_content(raw_messages):
         if char_len > cap:
             logger.warning(
                 "TOOL_GUARD: tool_result id={} len={} > cap={} for model '{}'; "
@@ -248,7 +259,7 @@ def try_minimax_tool_guard(
 
 
 def try_large_write_split_hint(
-    request_data: MessagesRequest, settings: Settings
+    request_data: MessagesRequest, _settings: Settings
 ) -> MessagesResponse | None:
     """Detect when the last assistant message requested an oversized Write/Edit.
 
@@ -263,17 +274,17 @@ def try_large_write_split_hint(
     cap = quirks.max_tool_tokens
     messages = getattr(request_data, "messages", []) or []
 
-# Scan last 5 messages for an oversized assistant tool_use
+    # Scan last 5 messages for an oversized assistant tool_use.
     if len(messages) < 2:
         return None
 
-    for prev in reversed(messages[-5:]):
-        if isinstance(prev, dict):
-            role = prev.get("role", "")
-            content = prev.get("content", [])
-        elif hasattr(prev, "role"):
-            role = prev.role
-            content = getattr(prev, "content", [])
+    for previous_message in reversed(messages[-5:]):
+        if isinstance(previous_message, dict):
+            role = previous_message.get("role", "")
+            content = previous_message.get("content", [])
+        elif hasattr(previous_message, "role"):
+            role = previous_message.role
+            content = getattr(previous_message, "content", [])
         else:
             continue
 
@@ -285,22 +296,22 @@ def try_large_write_split_hint(
 
         for block in content:
             if isinstance(block, dict):
-                btype = block.get("type", "")
-                binput = block.get("input", {})
+                block_type = block.get("type", "")
+                block_input = block.get("input", {})
             elif hasattr(block, "type"):
-                btype = block.type
-                binput = getattr(block, "input", {}) or {}
+                block_type = block.type
+                block_input = getattr(block, "input", {}) or {}
             else:
                 continue
 
-            if btype != "tool_use":
+            if block_type != "tool_use":
                 continue
-            if not isinstance(binput, dict):
+            if not isinstance(block_input, dict):
                 continue
 
             for field_name in ("content", "new_content", "new_string", "text"):
-                field_val = binput.get(field_name, "")
-                if isinstance(field_val, str) and len(field_val) > cap:
+                field_value = block_input.get(field_name, "")
+                if isinstance(field_value, str) and len(field_value) > cap:
                     tool_name = (
                         block.get("name", "tool")
                         if isinstance(block, dict)
@@ -310,11 +321,11 @@ def try_large_write_split_hint(
                         "WRITE_HINT: tool='{}' field='{}' len={} > cap={}; injecting split hint",
                         tool_name,
                         field_name,
-                        len(field_val),
+                        len(field_value),
                         cap,
                     )
                     hint = (
-                        f"The {tool_name} call attempted to write {len(field_val):,} characters "
+                        f"The {tool_name} call attempted to write {len(field_value):,} characters "
                         f"in a single operation (cap: {cap:,}). "
                         "Please split the content across multiple smaller write operations."
                     )
@@ -322,7 +333,7 @@ def try_large_write_split_hint(
                         request_data, hint, input_tokens=50, output_tokens=60
                     )
 
-        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -333,8 +344,8 @@ def try_large_write_split_hint(
 OPTIMIZATION_HANDLERS = [
     try_quota_mock,
     try_prefix_detection,
-    try_minimax_tool_guard,  # NEW – intercept oversized tool results early
-    try_large_write_split_hint,  # NEW – prevent giant re-writes
+    try_minimax_tool_guard,  # NEW - intercept oversized tool results early
+    try_large_write_split_hint,  # NEW - prevent giant re-writes
     try_title_skip,
     try_suggestion_skip,
     try_filepath_mock,

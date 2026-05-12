@@ -141,7 +141,6 @@ class TestBuildRequestBody:
         assert extra["chat_template_kwargs"] == {
             "thinking": True,
             "enable_thinking": True,
-            "reasoning_budget": body["max_tokens"],
         }
         assert "reasoning_budget" not in extra
 
@@ -211,8 +210,28 @@ class TestBuildRequestBody:
         assert body["extra_body"]["chat_template_kwargs"] == {
             "enable_thinking": False,
             "custom": "value",
-            "reasoning_budget": body["max_tokens"],
         }
+
+    def test_reasoning_budget_is_capped_below_large_output_budget(self):
+        req = MagicMock()
+        req.model = "test"
+        req.messages = [MagicMock(role="user", content="hi")]
+        req.max_tokens = 81920
+        req.system = None
+        req.temperature = None
+        req.top_p = None
+        req.stop_sequences = None
+        req.tools = None
+        req.tool_choice = None
+        req.extra_body = None
+        req.top_k = None
+
+        body = build_request_body(
+            req, NimSettings(reasoning_budget=1024), thinking_enabled=True
+        )
+
+        assert body["max_tokens"] == 81920
+        assert body["extra_body"]["chat_template_kwargs"]["reasoning_budget"] == 1024
 
     def test_chat_template_fields_present_for_mistral_model(self):
         req = MagicMock()
@@ -234,7 +253,6 @@ class TestBuildRequestBody:
         assert extra["chat_template_kwargs"] == {
             "thinking": True,
             "enable_thinking": True,
-            "reasoning_budget": body["max_tokens"],
         }
         assert extra["chat_template"] == "custom_template"
 

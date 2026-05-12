@@ -15,9 +15,7 @@ from .models.anthropic import MessagesRequest, TokenCountRequest
 from .models.execution_state import (
     CheckpointState,
     ExecutionPhase,
-    ExecutionState,
     ExecutionStateUpdate,
-    PlanStep,
 )
 from .models.responses import ModelResponse, ModelsListResponse
 from .services import ClaudeProxyService
@@ -71,7 +69,11 @@ def get_proxy_service(
     settings: Settings = Depends(get_settings),
 ) -> ClaudeProxyService:
     """Build the request service for route handlers."""
-    execution_state_store = getattr(request.app.state, "execution_state_store", None)
+    execution_state_store = (
+        getattr(request.app.state, "execution_state_store", None)
+        if settings.enable_execution_state_orchestration
+        else None
+    )
     return ClaudeProxyService(
         settings,
         provider_getter=lambda provider_type: dependencies.resolve_provider(
@@ -177,6 +179,7 @@ _FORWARDED_HEADER_NAMES = frozenset(
         "anthropic-beta",
         "anthropic-version",
         "x-session-id",
+        "x-parent-session-id",
         "anthropic-conversation-id",
     }
 )
@@ -188,12 +191,14 @@ async def create_message(
     service: ClaudeProxyService = Depends(get_proxy_service),
     _auth=Depends(require_api_key),
 ):
-    """Create a message (always streaming)."""
+    """Create a message response, streaming unless the client requested JSON."""
     forwarded = {
         k: v for k, v in request.headers.items() if k.lower() in _FORWARDED_HEADER_NAMES
     }
     if forwarded:
         request_data.forwarded_headers = forwarded
+    if request_data.stream is False:
+        return await service.create_message_nonstreaming(request_data)
     return service.create_message(request_data)
 
 
@@ -448,13 +453,9 @@ async def apply_plan(
     updated = tracker.apply_approved_plan(
         session_id=session_id,
         plan_text=plan_text,
+        parent_session_id=body.get("parent_session_id")
+        or request.headers.get("x-parent-session-id"),
     )
-
-    if updated is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Session not found",
-        )
 
     logger.info(
         "PLAN_APPLIED: session={} steps={}",

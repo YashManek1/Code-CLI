@@ -16,6 +16,7 @@ from providers.open_router import OpenRouterProvider
 from providers.registry import (
     PROVIDER_DESCRIPTORS,
     ProviderRegistry,
+    build_provider_config,
     create_provider,
 )
 
@@ -102,6 +103,28 @@ def test_create_provider_instantiates_each_builtin():
     ):
         for provider_id, provider_cls in cases.items():
             assert isinstance(create_provider(provider_id, settings), provider_cls)
+
+
+def test_nvidia_nim_provider_config_reserves_rate_limit_headroom():
+    settings = _make_settings(
+        provider_rate_limit=40,
+        nvidia_nim_rate_limit_headroom=2,
+    )
+
+    config = build_provider_config(PROVIDER_DESCRIPTORS["nvidia_nim"], settings)
+
+    assert config.rate_limit == 38
+
+
+def test_non_nim_provider_config_does_not_reserve_nim_headroom():
+    settings = _make_settings(
+        provider_rate_limit=40,
+        nvidia_nim_rate_limit_headroom=2,
+    )
+
+    config = build_provider_config(PROVIDER_DESCRIPTORS["open_router"], settings)
+
+    assert config.rate_limit == 40
 
 
 def test_provider_registry_caches_by_provider_id():

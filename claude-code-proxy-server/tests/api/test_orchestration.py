@@ -5,6 +5,7 @@ import json
 import pytest
 
 from api.execution_state_store import ExecutionStateStore
+from api.models.anthropic import MessagesRequest
 from api.models.execution_state import (
     CheckpointState,
     ExecutionPhase,
@@ -18,12 +19,20 @@ from api.orchestration.plan_parser import (
     parse_plan_text,
     split_by_status,
 )
+from api.orchestration.response_tracker import ResponseTracker
 from api.orchestration.state_injector import (
     build_orchestration_context,
     inject_execution_state_context,
     inject_execution_state_context_anthropic,
 )
-
+from api.services import (
+    ClaudeProxyService,
+    _disable_subagents_after_agent_error,
+    _disable_subagents_for_plan_only_request,
+    _inject_weak_model_quality_hint,
+    _maybe_disable_thinking_for_simple_prompt,
+)
+from config.settings import Settings
 
 # =========================================================================
 # Plan Parser
@@ -240,6 +249,170 @@ class TestInjectAnthropic:
 
 
 # =========================================================================
+# Service Session Lifecycle
+# =========================================================================
+
+
+class TestClaudeProxyServiceSessionLifecycle:
+    def test_extract_session_ids_from_claude_metadata_user_id_json(self):
+        service = object.__new__(ClaudeProxyService)
+        request = MessagesRequest(
+            model="kimi-k2",
+            messages=[],
+            metadata={
+                "user_id": json.dumps(
+                    {
+                        "session_id": "implementation-session",
+                        "parent_session_id": "plan-session",
+                    }
+                )
+            },
+        )
+
+        session_id, parent_session_id = service._extract_session_ids(request)
+
+        assert session_id == "implementation-session"
+        assert parent_session_id == "plan-session"
+
+    def test_extract_session_ids_from_forwarded_headers(self):
+        service = object.__new__(ClaudeProxyService)
+        request = MessagesRequest(
+            model="minimax-m2",
+            messages=[],
+            forwarded_headers={
+                "x-session-id": "implementation-session",
+                "x-parent-session-id": "plan-session",
+            },
+        )
+
+        session_id, parent_session_id = service._extract_session_ids(request)
+
+        assert session_id == "implementation-session"
+        assert parent_session_id == "plan-session"
+
+    def test_inject_execution_state_clones_parent_session(
+        self, tracker_store: ExecutionStateStore
+    ):
+        parent = ExecutionState(
+            session_id="plan-session",
+            approved_plan="# Plan\n- [ ] Implement continuity",
+            remaining_steps=[
+                PlanStep(step_id="s1", description="Implement continuity")
+            ],
+        )
+        tracker_store.save(parent)
+        service = object.__new__(ClaudeProxyService)
+        service._execution_state_store = tracker_store
+        request = MessagesRequest(model="kimi-k2", messages=[])
+
+        service._inject_execution_state(
+            request,
+            session_id="implementation-session",
+            parent_session_id="plan-session",
+        )
+
+        child = tracker_store.load("implementation-session")
+        assert child is not None
+        assert child.parent_session_id == "plan-session"
+        assert child.approved_plan == parent.approved_plan
+        assert child.active_model == "kimi-k2"
+        assert request.system is not None
+
+    def test_plan_only_request_removes_subagent_tools(self):
+        request = MessagesRequest(
+            model="kimi-k2",
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Create the test strategy. Stop after planning.",
+                }
+            ],
+            tools=[
+                {"name": "Agent", "description": "Spawn agent"},
+                {"name": "Read", "description": "Read file"},
+                {"name": "Task", "description": "Legacy agent"},
+            ],
+            tool_choice={"type": "tool", "name": "Agent"},
+        )
+
+        _disable_subagents_for_plan_only_request(request)
+
+        assert [tool.name for tool in request.tools or []] == ["Read"]
+        assert request.tool_choice is None
+
+    def test_agent_retry_error_removes_subagent_tools(self):
+        request = MessagesRequest(
+            model="kimi-k2",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_agent",
+                            "content": (
+                                "Agent type 'explore' not found. "
+                                "Available agents: general-purpose"
+                            ),
+                        }
+                    ],
+                }
+            ],
+            tools=[
+                {"name": "Agent", "description": "Spawn agent"},
+                {"name": "Read", "description": "Read file"},
+            ],
+        )
+
+        _disable_subagents_after_agent_error(request)
+
+        assert [tool.name for tool in request.tools or []] == ["Read"]
+
+    def test_simple_prompt_disables_thinking_for_speed(self):
+        settings = Settings()
+        settings.auto_disable_thinking_simple_prompts = True
+        request = MessagesRequest(
+            model="kimi-k2",
+            messages=[{"role": "user", "content": "What is pytest?"}],
+        )
+
+        _maybe_disable_thinking_for_simple_prompt(request, settings)
+
+        assert request.thinking is not None
+        assert request.thinking.type == "disabled"
+
+    def test_complex_prompt_keeps_thinking(self):
+        settings = Settings()
+        settings.auto_disable_thinking_simple_prompts = True
+        request = MessagesRequest(
+            model="kimi-k2",
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Plan the backend refactor and test strategy.",
+                }
+            ],
+        )
+
+        _maybe_disable_thinking_for_simple_prompt(request, settings)
+
+        assert request.thinking is None
+
+    def test_weak_model_quality_hint_injected_for_kimi(self):
+        settings = Settings()
+        settings.enable_weak_model_quality_hints = True
+        request = MessagesRequest(
+            model="moonshotai/kimi-k2",
+            messages=[{"role": "user", "content": "Help"}],
+        )
+
+        _inject_weak_model_quality_hint(request, settings)
+
+        assert isinstance(request.system, str)
+        assert "Provider quality guard" in request.system
+
+
+# =========================================================================
 # Execution Tracker
 # =========================================================================
 
@@ -250,6 +423,49 @@ def tracker_store(tmp_path):
 
 
 class TestExecutionTracker:
+    def test_apply_approved_plan_creates_state_when_missing(self, tracker_store):
+        tracker = ExecutionTracker(tracker_store)
+        updated = tracker.apply_approved_plan(
+            "new-session",
+            "# Plan\n- [ ] Write tests\n- [ ] Implement fix",
+        )
+
+        assert updated.session_id == "new-session"
+        assert updated.approved_plan is not None
+        assert [step.description for step in updated.remaining_steps] == [
+            "Write tests",
+            "Implement fix",
+        ]
+        loaded = tracker_store.load("new-session")
+        assert loaded is not None
+        assert loaded.approved_plan == updated.approved_plan
+
+    def test_apply_approved_plan_clones_parent_state_when_session_rotates(
+        self, tracker_store
+    ):
+        parent = ExecutionState(
+            session_id="plan-session",
+            active_model="kimi-k2",
+            approved_plan="# Old plan\n- [ ] Keep context",
+            validation_findings=["existing finding"],
+        )
+        tracker_store.save(parent)
+
+        tracker = ExecutionTracker(tracker_store)
+        updated = tracker.apply_approved_plan(
+            session_id="implementation-session",
+            plan_text="# New plan\n- [ ] Implement fix",
+            parent_session_id="plan-session",
+        )
+
+        assert updated.session_id == "implementation-session"
+        assert updated.parent_session_id == "plan-session"
+        assert updated.active_model == "kimi-k2"
+        assert updated.validation_findings == ["existing finding"]
+        assert [step.description for step in updated.remaining_steps] == [
+            "Implement fix",
+        ]
+
     def test_mark_step_completed(self, tracker_store):
         step = PlanStep(step_id="s1", description="Write tests")
         state = ExecutionState(
@@ -263,6 +479,40 @@ class TestExecutionTracker:
         assert updated is not None
         assert len(updated.completed_steps) == 1
         assert len(updated.remaining_steps) == 0
+
+
+class TestResponseTracker:
+    def test_tool_result_processing_is_idempotent(self, tracker_store):
+        state = ExecutionState(
+            session_id="t1",
+            remaining_steps=[
+                PlanStep(step_id="s1", description="First"),
+                PlanStep(step_id="s2", description="Second"),
+            ],
+        )
+        tracker_store.save(state)
+        tracker = ResponseTracker(tracker_store)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "ok",
+                    }
+                ],
+            }
+        ]
+
+        tracker.process_request_messages("t1", messages)
+        tracker.process_request_messages("t1", messages)
+
+        updated = tracker_store.load("t1")
+        assert updated is not None
+        assert [step.step_id for step in updated.completed_steps] == ["s1"]
+        assert [step.step_id for step in updated.remaining_steps] == ["s2"]
+        assert updated.processed_tool_result_ids == ["toolu_1"]
 
     def test_mark_step_in_progress(self, tracker_store):
         step = PlanStep(step_id="s1", description="Write tests")

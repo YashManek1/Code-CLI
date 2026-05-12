@@ -99,8 +99,8 @@ async def test_init_uses_configurable_timeouts():
         client_kwargs = mock_async_client.call_args.kwargs
         assert client_kwargs["headers"]["Accept-Encoding"] == "gzip"
         assert client_kwargs["headers"]["Connection"] == "keep-alive"
-        assert client_kwargs["limits"].max_connections == 10
-        assert client_kwargs["limits"].max_keepalive_connections == 10
+        assert client_kwargs["limits"].max_connections == 100
+        assert client_kwargs["limits"].max_keepalive_connections == 20
         call_kwargs = mock_openai.call_args[1]
         timeout = call_kwargs["timeout"]
         assert timeout.read == 600.0
@@ -125,7 +125,7 @@ async def test_build_request_body(provider_config):
     ctk = body["extra_body"]["chat_template_kwargs"]
     assert ctk["thinking"] is True
     assert ctk["enable_thinking"] is True
-    assert ctk["reasoning_budget"] == body["max_tokens"]
+    assert "reasoning_budget" not in ctk
     assert "reasoning_budget" not in body["extra_body"]
 
 
@@ -328,7 +328,7 @@ def _make_bad_request_error(message: str) -> openai.BadRequestError:
 async def test_stream_response_retries_without_chat_template(provider_config):
     provider = NvidiaNimProvider(
         provider_config,
-        nim_settings=NimSettings(chat_template="custom_template"),
+        nim_settings=NimSettings(chat_template="custom_template", reasoning_budget=100),
     )
     req = MockRequest(model="mistralai/mixtral-8x7b-instruct-v0.1")
 
@@ -443,6 +443,7 @@ async def test_tool_call_stream(nim_provider):
 @pytest.mark.asyncio
 async def test_stream_response_retries_without_reasoning_budget(nim_provider):
     req = MockRequest()
+    nim_provider._nim_settings = NimSettings(reasoning_budget=100)
 
     mock_chunk = MagicMock()
     mock_chunk.choices = [
@@ -470,7 +471,7 @@ async def test_stream_response_retries_without_reasoning_budget(nim_provider):
     second_call = mock_create.await_args_list[1].kwargs
     assert (
         first_call["extra_body"]["chat_template_kwargs"]["reasoning_budget"]
-        == first_call["max_tokens"]
+        == 100
     )
     assert "reasoning_budget" not in second_call["extra_body"]
     assert "reasoning_budget" not in second_call["extra_body"]["chat_template_kwargs"]

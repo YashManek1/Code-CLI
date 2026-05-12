@@ -190,22 +190,24 @@ def build_request_body(
     try:
         body = build_base_request_body(
             request_data,
-            reasoning_replay=ReasoningReplayMode.REASONING_CONTENT
-            if thinking_enabled
-            else ReasoningReplayMode.DISABLED,
+            reasoning_replay=(
+                ReasoningReplayMode.REASONING_CONTENT
+                if thinking_enabled
+                else ReasoningReplayMode.DISABLED
+            ),
         )
     except OpenAIConversionError as exc:
         raise InvalidRequestError(str(exc)) from exc
 
     _sanitize_nim_tool_schemas(body)
 
-    # NIM-specific max_tokens: cap against nim.max_tokens
+    # NIM-specific max_tokens: only send when the request specifies it, then cap.
+    # Leaving it unset avoids upstream 422s when NIM defaults differ per model.
     max_tokens = body.get("max_tokens") or getattr(request_data, "max_tokens", None)
-    if max_tokens is None:
-        max_tokens = nim.max_tokens
-    elif nim.max_tokens:
-        max_tokens = min(max_tokens, nim.max_tokens)
-    set_if_not_none(body, "max_tokens", max_tokens)
+    if max_tokens is not None:
+        if nim.max_tokens:
+            max_tokens = min(max_tokens, nim.max_tokens)
+        set_if_not_none(body, "max_tokens", max_tokens)
 
     # NIM-specific temperature/top_p: fall back to NIM defaults if request didn't set
     if body.get("temperature") is None and nim.temperature is not None:
@@ -236,8 +238,14 @@ def build_request_body(
         chat_template_kwargs = extra_body.setdefault(
             "chat_template_kwargs", {"thinking": True, "enable_thinking": True}
         )
-        if isinstance(chat_template_kwargs, dict):
-            chat_template_kwargs.setdefault("reasoning_budget", max_tokens)
+        if isinstance(chat_template_kwargs, dict) and nim.reasoning_budget is not None:
+            budget_cap = max_tokens if max_tokens is not None else nim.max_tokens
+            reasoning_budget = (
+                min(budget_cap, nim.reasoning_budget)
+                if budget_cap is not None
+                else nim.reasoning_budget
+            )
+            chat_template_kwargs.setdefault("reasoning_budget", reasoning_budget)
 
     req_top_k = getattr(request_data, "top_k", None)
     top_k = req_top_k if req_top_k is not None else nim.top_k

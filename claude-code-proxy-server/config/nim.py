@@ -20,6 +20,14 @@ class NimSettings(BaseModel):
         ge=1,
         description="Maximum number of tokens in output.",
     )
+    reasoning_budget: int | None = Field(
+        None,
+        ge=1,
+        description=(
+            "Optional hidden reasoning token budget for NIM chat templates. "
+            "Unset preserves the provider/model default."
+        ),
+    )
     presence_penalty: float = Field(0.0, ge=-2.0, le=2.0)
     frequency_penalty: float = Field(0.0, ge=-2.0, le=2.0)
     min_p: float = Field(
@@ -40,13 +48,13 @@ class NimSettings(BaseModel):
 
     @field_validator("top_k", mode="before")
     @classmethod
-    def validate_top_k(cls, v, info: ValidationInfo):
-        if v is None or v == "":
+    def validate_top_k(cls, value, info: ValidationInfo):
+        if value is None or value == "":
             return -1
-        int_v = int(v)
-        if int_v < -1:
+        integer_value = int(value)
+        if integer_value < -1:
             raise ValueError(f"{info.field_name} must be -1 or >= 0")
-        return int_v
+        return integer_value
 
     @field_validator(
         "temperature",
@@ -58,7 +66,7 @@ class NimSettings(BaseModel):
         mode="before",
     )
     @classmethod
-    def validate_float_fields(cls, v, info: ValidationInfo):
+    def validate_float_fields(cls, value, info: ValidationInfo):
         field_defaults = {
             "temperature": 1.0,
             "top_p": 1.0,
@@ -67,42 +75,43 @@ class NimSettings(BaseModel):
             "frequency_penalty": 0.0,
             "repetition_penalty": 1.0,
         }
-        if v is None or v == "":
+        if value is None or value == "":
             key = info.field_name or "temperature"
             return field_defaults.get(key, 1.0)
         try:
-            val = float(v)
+            float_value = float(value)
         except (TypeError, ValueError) as err:
             raise ValueError(
-                f"{info.field_name} must be a float. Got {type(v).__name__}."
+                f"{info.field_name} must be a float. Got {type(value).__name__}."
             ) from err
-        return val
+        return float_value
 
-    @field_validator("max_tokens", "min_tokens", mode="before")
+    @field_validator("max_tokens", "min_tokens", "reasoning_budget", mode="before")
     @classmethod
-    def validate_int_fields(cls, v, info: ValidationInfo):
+    def validate_int_fields(cls, value, info: ValidationInfo):
         field_defaults = {
             "max_tokens": ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
             "min_tokens": 0,
+            "reasoning_budget": None,
         }
-        if v is None or v == "":
+        if value is None or value == "":
             key = info.field_name or "max_tokens"
             return field_defaults.get(key, ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS)
         try:
-            val = int(v)
+            integer_value = int(value)
         except (TypeError, ValueError) as err:
             raise ValueError(
-                f"{info.field_name} must be an int. Got {type(v).__name__}."
+                f"{info.field_name} must be an int. Got {type(value).__name__}."
             ) from err
-        return val
+        return integer_value
 
     @field_validator("seed", mode="before")
     @classmethod
-    def parse_optional_int(cls, v, info: ValidationInfo):
-        if v == "" or v is None:
+    def parse_optional_int(cls, value, info: ValidationInfo):
+        if value == "" or value is None:
             return None
         try:
-            return int(v)
+            return int(value)
         except (TypeError, ValueError) as err:
             raise ValueError(
                 f"{info.field_name} must be an int or empty/None."
@@ -110,9 +119,9 @@ class NimSettings(BaseModel):
 
     @field_validator("stop", "chat_template", "request_id", mode="before")
     @classmethod
-    def parse_optional_str(cls, v, info: ValidationInfo):
-        if v == "":
+    def parse_optional_str(cls, value, info: ValidationInfo):
+        if value == "":
             return None
-        if v is not None and not isinstance(v, str):
-            return str(v)
-        return v
+        if value is not None and not isinstance(value, str):
+            return str(value)
+        return value

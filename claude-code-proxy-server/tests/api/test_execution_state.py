@@ -1,9 +1,6 @@
 """Tests for ExecutionState models, store, and serialization."""
 
 import json
-import os
-import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -16,7 +13,6 @@ from api.models.execution_state import (
     ExecutionStateUpdate,
     PlanStep,
 )
-
 
 # =========================================================================
 # Model tests
@@ -215,6 +211,28 @@ class TestExecutionStateStore:
         # Verify persisted
         loaded = temp_store.load("new-session")
         assert loaded is not None
+
+    def test_ensure_state_from_parent_clones_plan(self, temp_store: ExecutionStateStore):
+        parent = ExecutionState(
+            session_id="plan-session",
+            approved_plan="# Plan\n- [ ] Build it",
+            remaining_steps=[PlanStep(step_id="s1", description="Build it")],
+            implementation_phase=ExecutionPhase.backend_execution,
+        )
+        temp_store.save(parent)
+
+        child = temp_store.ensure_state_from_parent(
+            "implementation-session",
+            "plan-session",
+        )
+
+        assert child.session_id == "implementation-session"
+        assert child.parent_session_id == "plan-session"
+        assert child.approved_plan == parent.approved_plan
+        assert child.remaining_steps[0].description == "Build it"
+        loaded = temp_store.load("implementation-session")
+        assert loaded is not None
+        assert loaded.approved_plan == parent.approved_plan
 
     def test_delete(self, temp_store: ExecutionStateStore):
         state = ExecutionState(session_id="to-delete")

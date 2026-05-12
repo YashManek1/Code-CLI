@@ -474,6 +474,7 @@ export function switchSession(
   // (plans.ts getPlanSlug defaults to getSessionId()).
   STATE.planSlugCache.delete(STATE.sessionId)
   STATE.sessionId = sessionId
+  STATE.parentSessionId = undefined
   STATE.sessionProjectDir = projectDir
   sessionSwitched.emit(sessionId)
 }

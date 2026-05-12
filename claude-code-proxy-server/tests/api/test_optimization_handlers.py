@@ -5,6 +5,7 @@ from unittest.mock import patch
 from api.models.anthropic import ContentBlockText, Message, MessagesRequest
 from api.optimization_handlers import (
     try_filepath_mock,
+    try_large_write_split_hint,
     try_optimizations,
     try_prefix_detection,
     try_quota_mock,
@@ -199,6 +200,44 @@ class TestTryFilepathMock:
         block = result.content[0]
         assert isinstance(block, ContentBlockText)
         assert block.text == ""
+
+
+class TestTryLargeWriteSplitHint:
+    def test_scans_past_latest_non_matching_assistant_message(self):
+        settings = Settings()
+        oversized_text = "x" * 80
+        req = MessagesRequest(
+            model="minimax/minimax-m2.7",
+            messages=[
+                {"role": "user", "content": "write a file"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_large_write",
+                            "name": "Write",
+                            "input": {"content": oversized_text},
+                        }
+                    ],
+                },
+                {"role": "user", "content": "tool failed"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "I will retry smaller."}],
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        )
+
+        with patch("api.optimization_handlers._get_quirks") as mock_get_quirks:
+            mock_get_quirks.return_value.max_tool_tokens = 40
+            result = try_large_write_split_hint(req, settings)
+
+        assert result is not None
+        block = result.content[0]
+        assert isinstance(block, ContentBlockText)
+        assert "split the content" in block.text
 
 
 class TestTryOptimizations:

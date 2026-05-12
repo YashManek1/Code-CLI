@@ -1,5 +1,6 @@
 """Tests for streaming error handling in providers/nvidia_nim/client.py."""
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,17 +22,35 @@ class AsyncStreamMock:
     """Async iterable mock that yields chunks then optionally raises."""
 
     def __init__(self, chunks, error=None):
-        self._chunks = chunks
+        self._chunks = list(chunks)
         self._error = error
+        self._index = 0
 
     def __aiter__(self):
-        return self._aiter()
+        return self
 
-    async def _aiter(self):
-        for chunk in self._chunks:
-            yield chunk
+    async def __anext__(self):
+        if self._index < len(self._chunks):
+            chunk = self._chunks[self._index]
+            self._index += 1
+            return chunk
         if self._error:
-            raise self._error
+            # Clear error after raising so retries/multiple calls don't hang
+            err = self._error
+            self._error = None
+            raise err
+        raise StopAsyncIteration
+
+
+class HangingStreamMock:
+    """Async iterator that never produces a provider chunk."""
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        await asyncio.sleep(3600)
+        raise StopAsyncIteration
 
 
 def _make_provider():
@@ -41,6 +60,18 @@ def _make_provider():
         base_url="https://test.api.nvidia.com/v1",
         rate_limit=10,
         rate_window=60,
+    )
+    return NvidiaNimProvider(config, nim_settings=NimSettings())
+
+
+def _make_provider_with_stream_idle_timeout(timeout_s: float):
+    """Create a provider instance with a short stream-idle timeout."""
+    config = ProviderConfig(
+        api_key="test_key",
+        base_url="https://test.api.nvidia.com/v1",
+        rate_limit=10,
+        rate_window=60,
+        stream_idle_timeout=timeout_s,
     )
     return NvidiaNimProvider(config, nim_settings=NimSettings())
 
@@ -206,6 +237,38 @@ class TestStreamingExceptionHandling:
         assert "request_id=req_timeout123" in event_text
         assert "message_stop" in event_text
         _assert_no_content_deltas_after_error_text(events, "timed out after")
+
+    @pytest.mark.asyncio
+    async def test_upstream_idle_stream_emits_final_error_tail(self):
+        """Provider streams that only heartbeat must eventually terminate."""
+        provider = _make_provider_with_stream_idle_timeout(0.02)
+        request = _make_request()
+
+        with (
+            patch("providers.openai_compat._DEFAULT_CHUNK_TIMEOUT", 0.01),
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                return_value=HangingStreamMock(),
+            ),
+            patch.object(
+                provider._global_rate_limiter,
+                "wait_if_blocked",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            events = await asyncio.wait_for(
+                _collect_stream(provider, request),
+                timeout=0.5,
+            )
+
+        event_text = "".join(events)
+        assert "stream stalled" in event_text
+        assert "message_delta" in event_text
+        assert "message_stop" in event_text
+        assert_anthropic_stream_contract(parse_sse_text(event_text))
 
     @pytest.mark.asyncio
     async def test_error_after_partial_content(self):
@@ -726,6 +789,242 @@ class TestProcessToolCall:
 
 class TestStreamChunkEdgeCases:
     """Tests for edge cases in stream chunk handling."""
+
+    @pytest.mark.asyncio
+    async def test_python_repr_empty_structured_text_does_not_leak(self):
+        """Provider repr strings like [{'type':'text','text':''}] are normalized away."""
+        provider = _make_provider()
+        request = _make_request()
+
+        repr_chunk = _make_chunk(content="[{'type':'text','text':''}]")
+        finish_chunk = _make_chunk(finish_reason="stop")
+        stream_mock = AsyncStreamMock([repr_chunk, finish_chunk])
+
+        with (
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                return_value=stream_mock,
+            ),
+            patch.object(
+                provider._global_rate_limiter,
+                "wait_if_blocked",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            events = await _collect_stream(provider, request)
+
+        event_text = "".join(events)
+        assert "[{'type':'text','text':''}]" not in event_text
+        assert '"text_delta"' in event_text
+        assert "message_stop" in event_text
+
+    @pytest.mark.asyncio
+    async def test_partial_python_repr_text_wrapper_does_not_leak(self):
+        """Partial repr wrappers from Kimi are dropped instead of shown as text."""
+        provider = _make_provider()
+        request = _make_request()
+
+        repr_chunk = _make_chunk(content="[{'type':'text','text':''")
+        finish_chunk = _make_chunk(finish_reason="stop")
+        stream_mock = AsyncStreamMock([repr_chunk, finish_chunk])
+
+        with (
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                return_value=stream_mock,
+            ),
+            patch.object(
+                provider._global_rate_limiter,
+                "wait_if_blocked",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            events = await _collect_stream(provider, request)
+
+        event_text = "".join(events)
+        assert "[{'type':'text'" not in event_text
+        assert "message_stop" in event_text
+
+    @pytest.mark.asyncio
+    async def test_kimi_dangling_list_prefix_is_not_emitted(self):
+        """A lone '[' chunk from a leaked content-list wrapper is transport noise."""
+        provider = _make_provider()
+        request = _make_request()
+
+        repr_chunk = _make_chunk(content="[")
+        finish_chunk = _make_chunk(finish_reason="stop")
+        stream_mock = AsyncStreamMock([repr_chunk, finish_chunk])
+
+        with (
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                return_value=stream_mock,
+            ),
+            patch.object(
+                provider._global_rate_limiter,
+                "wait_if_blocked",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            events = await _collect_stream(provider, request)
+
+        event_text = "".join(events)
+        assert '"text":"["' not in event_text
+        assert "message_stop" in event_text
+
+    @pytest.mark.asyncio
+    async def test_kimi_bracket_prefixed_text_drops_artifact_prefix(self):
+        """Malformed '[Text...' chunks should stream as normal text without '['."""
+        provider = _make_provider()
+        request = _make_request()
+
+        repr_chunk = _make_chunk(content="[Let me create a comprehensive test plan.")
+        finish_chunk = _make_chunk(finish_reason="stop")
+        stream_mock = AsyncStreamMock([repr_chunk, finish_chunk])
+
+        with (
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                return_value=stream_mock,
+            ),
+            patch.object(
+                provider._global_rate_limiter,
+                "wait_if_blocked",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            events = await _collect_stream(provider, request)
+
+        event_text = "".join(events)
+        assert "[Let me" not in event_text
+        assert "Let me create a comprehensive test plan." in event_text
+        assert "message_stop" in event_text
+
+    @pytest.mark.asyncio
+    async def test_kimi_text_emitted_tool_call_does_not_leak_as_text(self):
+        """Kimi functions.Read:0{...} text should become a tool call, not UI text."""
+        provider = _make_provider()
+        request = _make_request(model="moonshotai/kimi-k2-instruct")
+
+        tool_text_chunk = _make_chunk(
+            content=(
+                "Now let me read the test file "
+                'functions.Read:0{"file_path":"backend/tests/test_audio_processor.py"}'
+            )
+        )
+        finish_chunk = _make_chunk(finish_reason="stop")
+        stream_mock = AsyncStreamMock([tool_text_chunk, finish_chunk])
+
+        with (
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                return_value=stream_mock,
+            ),
+            patch.object(
+                provider._global_rate_limiter,
+                "wait_if_blocked",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            events = await _collect_stream(provider, request)
+
+        event_text = "".join(events)
+        assert "Now let me read the test file" in event_text
+        assert "functions.Read" not in event_text
+        assert '"type":"tool_use"' in event_text
+        assert '"name":"Read"' in event_text
+        assert "backend/tests/test_audio_processor.py" in event_text
+
+    @pytest.mark.asyncio
+    async def test_nested_malformed_kimi_text_wrapper_recovers_inner_text(self):
+        """Nested malformed repr wrappers should recover useful inner text."""
+        provider = _make_provider()
+        request = _make_request()
+
+        repr_chunk = _make_chunk(
+            content=(
+                "[{'type':'text','text':\"[{'type':'text','text':'Read the file'}\"}]"
+            )
+        )
+        finish_chunk = _make_chunk(finish_reason="stop")
+        stream_mock = AsyncStreamMock([repr_chunk, finish_chunk])
+
+        with (
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                return_value=stream_mock,
+            ),
+            patch.object(
+                provider._global_rate_limiter,
+                "wait_if_blocked",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            events = await _collect_stream(provider, request)
+
+        event_text = "".join(events)
+        assert "[{'type':'text'" not in event_text
+        assert "Read the file" in event_text
+        assert "message_stop" in event_text
+
+    @pytest.mark.asyncio
+    async def test_structured_content_tool_use_dict_emits_tool_block(self):
+        """Content-array tool_use blocks are converted to Anthropic tool_use SSE."""
+        provider = _make_provider()
+        request = _make_request()
+
+        structured_chunk = _make_chunk(
+            content=[
+                {
+                    "type": "tool_use",
+                    "id": "call_structured",
+                    "name": "Read",
+                    "input": {"file_path": "a.py"},
+                }
+            ]
+        )
+        stream_mock = AsyncStreamMock([structured_chunk])
+
+        with (
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                return_value=stream_mock,
+            ),
+            patch.object(
+                provider._global_rate_limiter,
+                "wait_if_blocked",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            events = await _collect_stream(provider, request)
+
+        event_text = "".join(events)
+        assert "tool_use" in event_text
+        assert "call_structured" in event_text
+        assert "Read" in event_text
+        assert "input_json_delta" in event_text
+        assert '"stop_reason":"tool_use"' in event_text
 
     @pytest.mark.asyncio
     async def test_stream_chunk_with_empty_choices_skipped(self):
