@@ -492,7 +492,7 @@ class TelegramPlatform(MessagingPlatform):
         return self._connected
 
     async def _on_start_command(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+        self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
         """Handle /start command."""
         if update.message:
@@ -501,7 +501,7 @@ class TelegramPlatform(MessagingPlatform):
         await self._on_telegram_message(update, context)
 
     async def _on_telegram_message(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+        self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
         """Handle incoming updates."""
         if (
@@ -583,7 +583,7 @@ class TelegramPlatform(MessagingPlatform):
                 )
 
     async def _on_telegram_voice(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+        self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
         """Handle incoming voice messages."""
         if (

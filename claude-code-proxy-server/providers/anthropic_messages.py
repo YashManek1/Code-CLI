@@ -255,7 +255,9 @@ class AnthropicMessagesTransport(BaseProvider):
     def _new_stream_state(self, request: Any, *, thinking_enabled: bool) -> Any:
         """Return per-stream provider state for event transformation."""
         if self.stream_chunk_mode == "line":
-            return NativeSseBlockPolicyState()
+            return NativeSseBlockPolicyState(
+                model=str(getattr(request, "model", "") or "")
+            )
         return None
 
     def _transform_stream_event(

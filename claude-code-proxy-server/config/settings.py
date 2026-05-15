@@ -246,6 +246,13 @@ class Settings(BaseSettings):
         default=False, validation_alias="WEB_FETCH_ALLOW_PRIVATE_NETWORKS"
     )
 
+    # ==================== Healing Loop Architecture ====================
+    healing_enabled: bool = Field(default=True, validation_alias="HEALING_ENABLED")
+    max_healing_attempts: int = Field(default=3, validation_alias="MAX_HEALING_ATTEMPTS")
+    validate_stream_integrity: bool = Field(
+        default=True, validation_alias="VALIDATE_STREAM_INTEGRITY"
+    )
+
     # ==================== Debug / diagnostic logging (avoid sensitive content) ====================
     # When false (default), API and SSE helpers log only metadata (counts, lengths, ids).
     log_raw_api_payloads: bool = Field(

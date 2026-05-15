@@ -38,7 +38,7 @@ from .web_tools.request import (
 )
 from .web_tools.streaming import stream_web_server_tool_response
 
-TokenCounter = Callable[[list[Any], str | list[Any] | None, list[Any] | None], int]
+TokenCounterFn = Callable[[list[Any], str | list[Any] | None, list[Any] | None], int]
 
 ProviderGetter = Callable[[str], BaseProvider]
 
@@ -266,8 +266,7 @@ def _maybe_disable_thinking_for_simple_prompt(
     if not text or len(text) > _SIMPLE_PROMPT_MAX_CHARS:
         return
     if "```" in text or any(
-        re.search(rf"\b{re.escape(word)}\b", lowered)
-        for word in _COMPLEX_PROMPT_WORDS
+        re.search(rf"\b{re.escape(word)}\b", lowered) for word in _COMPLEX_PROMPT_WORDS
     ):
         return
     if lowered.endswith("?") or lowered.startswith(_SIMPLE_PROMPT_PREFIXES):
@@ -447,7 +446,9 @@ async def _stream_messages_response(
 
     for event in sse.close_content_blocks():
         yield event
-    yield sse.message_delta(response.stop_reason or "end_turn", response.usage.output_tokens)
+    yield sse.message_delta(
+        response.stop_reason or "end_turn", response.usage.output_tokens
+    )
     yield sse.message_stop()
 
 
@@ -459,7 +460,7 @@ class ClaudeProxyService:
         settings: Settings,
         provider_getter: ProviderGetter,
         model_router: ModelRouter | None = None,
-        token_counter: TokenCounter = get_token_count,
+        token_counter: TokenCounterFn = get_token_count,
         execution_state_store: ExecutionStateStore | None = None,
     ):
         self._settings = settings

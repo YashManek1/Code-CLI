@@ -1,0 +1,117 @@
+{
+  "input": [
+    "Go though entire proxy-server make a proper plan to test stabilization, integration,streaming,etc every little details every outcome should be properly tested make a proper plan for it"
+  ],
+  "output": [
+    {
+      "type": "system",
+      "subtype": "api_error",
+      "level": "error",
+      "error": {
+        "status": 500,
+        "headers": {
+          "content-length": "48",
+          "content-type": "application/json",
+          "date": "Thu, 14 May 2026 17:30:24 GMT",
+          "server": "uvicorn"
+        },
+        "error": {
+          "detail": "invalid syntax (request.py, line 8)"
+        }
+      },
+      "retryInMs": 552.486874140985,
+      "retryAttempt": 1,
+      "maxRetries": 10,
+      "timestamp": "2026-05-14T17:30:24.914Z",
+      "uuid": "abf7fd97-1e94-40d1-80f5-f45f77b8a7b7"
+    },
+    {
+      "type": "system",
+      "subtype": "api_error",
+      "level": "error",
+      "error": {
+        "status": 500,
+        "headers": {
+          "content-length": "48",
+          "content-type": "application/json",
+          "date": "Thu, 14 May 2026 17:30:24 GMT",
+          "server": "uvicorn"
+        },
+        "error": {
+          "detail": "invalid syntax (request.py, line 8)"
+        }
+      },
+      "retryInMs": 1135.2843373102642,
+      "retryAttempt": 2,
+      "maxRetries": 10,
+      "timestamp": "2026-05-14T17:30:25.498Z",
+      "uuid": "9ddcb213-0c29-404b-8879-8f6ab544d797"
+    },
+    {
+      "type": "system",
+      "subtype": "api_error",
+      "level": "error",
+      "error": {
+        "status": 500,
+        "headers": {
+          "content-length": "48",
+          "content-type": "application/json",
+          "date": "Thu, 14 May 2026 17:30:26 GMT",
+          "server": "uvicorn"
+        },
+        "error": {
+          "detail": "invalid syntax (request.py, line 8)"
+        }
+      },
+      "retryInMs": 2312.6802092756843,
+      "retryAttempt": 3,
+      "maxRetries": 10,
+      "timestamp": "2026-05-14T17:30:26.647Z",
+      "uuid": "bde5f395-9621-4e90-a5ee-50c892195b06"
+    },
+    {
+      "type": "system",
+      "subtype": "api_error",
+      "level": "error",
+      "error": {
+        "status": 500,
+        "headers": {
+          "content-length": "48",
+          "content-type": "application/json",
+          "date": "Thu, 14 May 2026 17:30:28 GMT",
+          "server": "uvicorn"
+        },
+        "error": {
+          "detail": "invalid syntax (request.py, line 8)"
+        }
+      },
+      "retryInMs": 4238.941358308747,
+      "retryAttempt": 4,
+      "maxRetries": 10,
+      "timestamp": "2026-05-14T17:30:28.966Z",
+      "uuid": "295a7a20-63bb-4fdf-a16f-8225afdcdf9d"
+    },
+    {
+      "type": "system",
+      "subtype": "api_error",
+      "level": "error",
+      "error": {
+        "status": 500,
+        "headers": {
+          "content-length": "48",
+          "content-type": "application/json",
+          "date": "Thu, 14 May 2026 17:30:33 GMT",
+          "server": "uvicorn"
+        },
+        "error": {
+          "detail": "invalid syntax (request.py, line 8)"
+        }
+      },
+      "retryInMs": 8090.652782394161,
+      "retryAttempt": 5,
+      "maxRetries": 10,
+      "timestamp": "2026-05-14T17:30:33.219Z",
+      "uuid": "a149c38e-8f5d-40d1-b2f4-ac2cea69325d"
+    }
+  ]
+}

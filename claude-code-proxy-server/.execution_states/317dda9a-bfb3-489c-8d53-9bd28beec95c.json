@@ -1,0 +1,92 @@
+{
+  "session_id": "317dda9a-bfb3-489c-8d53-9bd28beec95c",
+  "parent_session_id": null,
+  "active_model": "claude-sonnet-4-6",
+  "current_checkpoint": null,
+  "implementation_phase": "idle",
+  "approved_plan": "# Stability Assessment Plan: claude-code-proxy-server\n\n## Context\n\nThis is a FastAPI-based reverse proxy that routes Claude Code CLI requests to 6 LLM providers (NIM, OpenRouter, DeepSeek, LM Studio, llama.cpp, Ollama), with Discord/Telegram messaging integration and execution-state orchestration for multi-step workflows. With 100+ test files, existing health probes, and graceful shutdown patterns, the system has a foundation — but known gaps (no circuit breakers, lossy JSON repair, infinite model cache) need to be quantified.\n\n## Goal\n\nFull quantitative stability assessment — 5 phases.\n\n---\n\n## Phase 1: Run Existing Test Suite (Baseline)\n\nRun the full pytest suite to establish what passes and fails today.\n\n```bash\ncd claude-code-proxy-server && pytest tests/ -x -q --tb=line 2>&1 | head -100\n```\n\nThen targeted runs:\n- Smoke/import: `pytest test_import.py test_import_v2.py -v`\n- Contract tests: `pytest tests/contracts/ -v`\n- Rate limit tests: `pytest tests/providers/test_provider_rate_limit.py -v`\n- Streaming error tests: `pytest tests/providers/test_streaming_errors.py -v`\n\nIdentify: flaky tests, environment failures, skipped `live` tests.\n\n**Files:** `pyproject.toml`, `tests/conftest.py`, `tests/api/`, `tests/providers/`, `tests/contracts/`\n\n---\n\n## Phase 2: Probe-Based Health Verification\n\nWith the server running (`python server.py`), test all health endpoints:\n\n```bash\ncurl -s http://localhost:8000/health\ncurl -I http://localhost:8000/health   # expect 204\ncurl -I -X OPTIONS http://localhost:8000/\ncurl -I http://localhost:8000/v1/messages\n```\n\nExpected: `{\"status\":\"healthy\"}` for GET, 204 + `Allow: GET, HEAD, OPTIONS` for HEAD/OPTIONS.\n\n**Files:** `api/routes.py:87-256`\n\n---\n\n## Phase 3: Failure Injection\n\nTest how the system degrades under fault conditions:\n\n| Scenario | How | Expected | Measure |\n|---|---|---|---|\n| Provider timeout | Disable NIM network access | 503 after ~60s connect timeout | Time to error |\n| Rate limit hit (429) | Trigger `GlobalRateLimiter` reactive block | Requests queue then unblock | Block/unblock timing |\n| Messaging platform down | Set invalid Telegram/Discord token, restart | Platform skipped, server starts | Startup logs |\n| Corrupt state file | Write invalid JSON to `.execution_states/{id}.json` | Warning + empty state returned | Log output |\n| Model not found | Request non-existent model | 400 from `validate_configured_models` | Error response |\n\nKey code to trace: `providers/rate_limit.py:execute_with_retry` — does it retry on 500/503/timeout? (Spoiler: no, only 429.)\n\n**Files:** `api/runtime.py`, `providers/rate_limit.py`, `api/execution_state_store.py`, `providers/registry.py`\n\n---\n\n## Phase 4: Concurrency & Race Condition Analysis\n\n- Check `max_concurrency: 5` semaphore in `GlobalRateLimiter` — does it correctly gate all concurrent streams?\n- Verify `StrictSlidingWindowLimiter` (`core/rate_limit.py`) — single `asyncio.Lock` guarded deque, confirm no deadlock path under concurrent load\n- Examine `ExecutionStateStore` atomic write: `tempfile + os.replace` — confirm no partial-write corrupt state possible\n- Check `concurrency_slot` context manager for proper release on cancellation\n\n```bash\n# Verify rate limit concurrency gating exists\ngrep -n \"concurrency\" claude-code-proxy-server/providers/rate_limit.py\ngrep -n \"Semaphore\" claude-code-proxy-server/providers/rate_limit.py\n```\n\n**Files:** `providers/rate_limit.py`, `core/rate_limit.py`, `api/execution_state_store.py`\n\n---\n\n## Phase 5: Known Risk Quantification\n\nBased on code exploration, these are the confirmed gaps to measure:\n\n| Risk | Location | Impact | How to Quantify |\n|---|---|---|---|\n| No retry on non-429 errors | `providers/rate_limit.py` `execute_with_retry` | One 503 kills a request | Confirm code path: only `RateLimitError` and `httpx 429` trigger retry |\n| Infinite model list cache | `providers/registry.py` `refresh_model_list_cache` | Stale model lists until restart | Confirm no TTL/invalidation in code |\n| JSON repair falls back to `{}` | `core/anthropic/tools.py` `repair_tool_arguments` | Broken tool calls silently get empty args | Test malformed JSON input |\n| Stream stall on slow TTFT | `providers/openai_compat.py` idle timeout | Premature stream termination | Measure effective timeout vs MiniMax TTFT |\n| No circuit breaker on 500/503/timeout | `providers/rate_limit.py` | Requests keep hitting unhealthy provider | Confirm no `set_blocked` on status >= 500 |\n| Orchestration XML injection | `api/orchestration/state_injector.py` | Plan with special chars could break injection | Check if special chars are escaped |\n\nRead these files to validate each gap:\n- `providers/rate_limit.py`\n- `providers/registry.py`\n- `core/anthropic/tools.py`\n- `api/orchestration/state_injector.py`\n- `providers/openai_compat.py`\n- `api/execution_state_store.py`\n\n---\n\n## Output: Stability Report\n\nAfter all phases complete, produce a concise report:\n\n**Passing:** Components that behave correctly (graceful shutdown, atomic writes, rate limiter correctness, stream contracts)\n\n**Known Weaknesses (by blast radius):**\n1. **Critical**: No circuit breaker for 500/503/timeout — every failing request waits for timeout before failing\n2. **High**: Infinite model cache — stale model lists, no refresh mechanism\n3. **Medium**: JSON repair fallback to `{}` — silent tool failure on malformed response\n4. **Low**: Stream idle timeout edge cases for very slow first-token models\n\n**Recommended Fixes (prioritized):**\n1. Add circuit breaker: call `set_blocked(seconds)` on 500/503/timeout in `execute_with_retry`\n2. Add TTL-based cache invalidation to `refresh_model_list_cache`\n3. Log/reject instead of silently falling back to `{}` in JSON repair\n4. Add structured `<execution_state>` sanitization before injection\n\n---\n\n## Verification Commands\n\n```bash\n# 1. Baseline — full test suite\ncd claude-code-proxy-server && pytest tests/ -q --tb=line 2>&1 | tail -20\n\n# 2. Import sanity\ncd claude-code-proxy-server && python test_import.py 2>&1\n\n# 3. Health probes (server running on port 8000)\ncurl -s http://localhost:8000/health\n\n# 4. Rate limit contract tests\ncd claude-code-proxy-server && pytest tests/providers/test_provider_rate_limit.py -v\n\n# 5. Stream contract tests\ncd claude-code-proxy-server && pytest tests/contracts/test_stream_contracts.py -v\n\n# 6. Import boundary contract tests\ncd claude-code-proxy-server && pytest tests/contracts/test_import_boundaries.py -v\n```",
+  "completed_steps": [],
+  "remaining_steps": [
+    {
+      "step_id": "5942067c613d",
+      "description": "**Critical**: No circuit breaker for 500/503/timeout — every failing request waits for timeout before failing",
+      "status": "pending",
+      "completed_at": null
+    },
+    {
+      "step_id": "7cd53ed67008",
+      "description": "**High**: Infinite model cache — stale model lists, no refresh mechanism",
+      "status": "pending",
+      "completed_at": null
+    },
+    {
+      "step_id": "4126d105faa4",
+      "description": "**Medium**: JSON repair fallback to `{}` — silent tool failure on malformed response",
+      "status": "pending",
+      "completed_at": null
+    },
+    {
+      "step_id": "772bdeec50d7",
+      "description": "**Low**: Stream idle timeout edge cases for very slow first-token models",
+      "status": "pending",
+      "completed_at": null
+    },
+    {
+      "step_id": "ac8722a70ca9",
+      "description": "Add circuit breaker: call `set_blocked(seconds)` on 500/503/timeout in `execute_with_retry`",
+      "status": "pending",
+      "completed_at": null
+    },
+    {
+      "step_id": "c67812650715",
+      "description": "Add TTL-based cache invalidation to `refresh_model_list_cache`",
+      "status": "pending",
+      "completed_at": null
+    },
+    {
+      "step_id": "436723a87b29",
+      "description": "Log/reject instead of silently falling back to `{}` in JSON repair",
+      "status": "pending",
+      "completed_at": null
+    },
+    {
+      "step_id": "94c67c009dc2",
+      "description": "Add structured `<execution_state>` sanitization before injection",
+      "status": "pending",
+      "completed_at": null
+    }
+  ],
+  "locked_rules": [],
+  "active_files": [],
+  "architecture_sources": [],
+  "validation_findings": [],
+  "processed_tool_result_ids": [
+    "call-6d787f3a-28ac-4ed2-8e51-a946f46198cb",
+    "call-531cb6d5-c9ae-473a-85e2-152ebfe0b1f8",
+    "call-d5f194fd-f2bb-451b-aabf-bcc9db0ad2c9",
+    "call-17ea24af-b6f2-4d2a-bb71-dfc69752c93e",
+    "call-b4fc8864-2aa9-493d-b9e8-b0617bb4ab46",
+    "call-97b64c11-48c0-47b8-a89b-6798b0686e41",
+    "call-8341cee9-830d-43ab-b78e-2f393e562785",
+    "call-e583ca67-6b51-4080-b48b-70734fde5733",
+    "call-7be2d3bb-8a9c-41ad-9bf8-301c97d71192",
+    "call-38152cec-bbe6-41dd-aee3-cda05a950be2",
+    "call-813f7757-a6a7-4c6e-85c2-a0d513c32852",
+    "call-7801ffd1-036d-4879-998b-b88c87a79309",
+    "call-955dff19-807a-424c-bacd-d4044adfecc5",
+    "call-f2daddcf-1691-41a2-9d8c-a9dd4485dbd3",
+    "call-96c2738a-b551-4438-b130-a19912d34262",
+    "call-4632940c-43be-4684-89f7-9f528b72550a",
+    "call-52898bd4-73c9-40ca-8b21-60209938d56b",
+    "call-236d2a30-a9df-47b6-ba1c-1fd11daa29a8",
+    "call-f3ee17bf-bf5a-4929-88ab-2594b9996512",
+    "call-3247faf2-f9d3-4320-bc5d-02b4f3ee649c",
+    "call-53774504-f131-4e3a-a5c4-250e486a37e7",
+    "call-3e374485-3dc7-46bd-bfed-7e29f6326824",
+    "call-d33f8e6f-8927-4643-969d-0086cb9cd2cc",
+    "call-dceae617-6241-4fce-8dc5-b17c38f52dd1",
+    "call-583867bf-f456-4aa2-978a-a613e6ff94a0"
+  ],
+  "last_updated": "2026-05-13T08:09:10.208874Z",
+  "version": 1
+}

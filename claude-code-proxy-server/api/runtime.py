@@ -98,19 +98,33 @@ class AppRuntime:
         cls,
         app: FastAPI,
         settings: Settings | None = None,
+        provider_registry: ProviderRegistry | None = None,
     ) -> AppRuntime:
-        return cls(app=app, settings=settings or get_settings())
+        runtime = cls(app=app, settings=settings or get_settings())
+        if provider_registry:
+            runtime._provider_registry = provider_registry
+        return runtime
+
+    async def _warmup_nim_connection(self) -> None:
+        try:
+            if self._provider_registry is not None:
+                provider = self._provider_registry.get("nvidia_nim", self.settings)
+                await asyncio.wait_for(provider.list_model_ids(), timeout=10.0)
+                logger.info("NIM_WARMUP: connection pool established")
+        except Exception as exc:
+            logger.debug("NIM_WARMUP: skipped exc_type={}", type(exc).__name__)
 
     async def startup(self) -> None:
         logger.info("Starting Claude Code Proxy...")
-        self._provider_registry = ProviderRegistry()
+        if self._provider_registry is None:
+            self._provider_registry = ProviderRegistry()
         self.app.state.provider_registry = self._provider_registry
         try:
             warn_if_process_auth_token(self.settings)
+            if "nvidia_nim" in getattr(self.settings, "provider_type", ""):
+                asyncio.create_task(self._warmup_nim_connection())
             if self.settings.enable_provider_model_discovery:
-                await self._provider_registry.validate_configured_models(
-                    self.settings
-                )
+                await self._provider_registry.validate_configured_models(self.settings)
                 self._provider_registry.start_model_list_refresh(self.settings)
             else:
                 logger.info(
@@ -240,7 +254,7 @@ class AppRuntime:
         os.makedirs(data_path, exist_ok=True)
 
         api_url = f"http://{self.settings.host}:{self.settings.port}/v1"
-        allowed_dirs = [workspace] if self.settings.allowed_dir else []
+        allowed_dirs = [workspace]
         plans_dir_abs = os.path.abspath(
             os.path.join(self.settings.claude_workspace, "plans")
         )

@@ -7,6 +7,7 @@ import json
 from core.anthropic.native_sse_block_policy import (
     NativeSseBlockPolicyState,
     format_native_sse_event,
+    parse_native_sse_event,
     transform_native_sse_block_event,
 )
 
@@ -131,3 +132,37 @@ def test_startless_text_delta_synthesizes_start_when_thinking_disabled() -> None
     assert "content_block_start" in (out or "")
     assert "Hello" in (out or "")
     assert "text_delta" in (out or "")
+
+
+def test_message_start_repairs_missing_model() -> None:
+    st = NativeSseBlockPolicyState(model="deepseek/deepseek-chat")
+    payload = {
+        "type": "message_start",
+        "message": {
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+        },
+    }
+    ev = format_native_sse_event("message_start", json.dumps(payload))
+    out = transform_native_sse_block_event(ev, st, thinking_enabled=True)
+    assert out is not None
+    _, data_text = parse_native_sse_event(out)
+    parsed = json.loads(data_text)
+    message = parsed.get("message")
+    assert isinstance(message, dict)
+    assert message.get("model") == "deepseek/deepseek-chat"
+
+
+def test_message_start_repairs_missing_message_object() -> None:
+    st = NativeSseBlockPolicyState(model="nvidia_nim/meta/llama-3.3-70b-instruct")
+    payload = {"type": "message_start"}
+    ev = format_native_sse_event("message_start", json.dumps(payload))
+    out = transform_native_sse_block_event(ev, st, thinking_enabled=True)
+    assert out is not None
+    _, data_text = parse_native_sse_event(out)
+    parsed = json.loads(data_text)
+    message = parsed.get("message")
+    assert isinstance(message, dict)
+    assert message.get("model") == "nvidia_nim/meta/llama-3.3-70b-instruct"

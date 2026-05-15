@@ -1,0 +1,20 @@
+{
+  "session_id": "0fff5523-590c-48a5-99cd-6254e288b147",
+  "parent_session_id": null,
+  "active_model": "claude-opus-4-6",
+  "current_checkpoint": null,
+  "implementation_phase": "idle",
+  "approved_plan": null,
+  "completed_steps": [],
+  "remaining_steps": [],
+  "locked_rules": [],
+  "active_files": [],
+  "architecture_sources": [],
+  "validation_findings": [],
+  "processed_tool_result_ids": [],
+  "pending_subtasks": [],
+  "retry_history": [],
+  "validation_failures": [],
+  "last_updated": "2026-05-14T15:05:50.932051Z",
+  "version": 1
+}

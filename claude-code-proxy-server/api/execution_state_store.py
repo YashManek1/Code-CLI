@@ -35,15 +35,15 @@ class ExecutionStateStore:
     def __init__(self, base_dir: str = ".execution_states") -> None:
         self._base_dir = Path(base_dir)
         self._base_dir.mkdir(parents=True, exist_ok=True)
-        self._locks: dict[str, threading.Lock] = {}
+        self._session_locks: dict[str, threading.Lock] = {}
         self._global_lock = threading.Lock()
 
     def _session_lock(self, session_id: str) -> threading.Lock:
         """Return or create a per-session lock."""
         with self._global_lock:
-            if session_id not in self._locks:
-                self._locks[session_id] = threading.Lock()
-            return self._locks[session_id]
+            if session_id not in self._session_locks:
+                self._session_locks[session_id] = threading.Lock()
+            return self._session_locks[session_id]
 
     def _file_path(self, session_id: str) -> Path:
         """Return the JSON file path for a session."""
@@ -96,9 +96,7 @@ class ExecutionStateStore:
             *state.progress_summary(),
         )
 
-    def update(
-        self, session_id: str, patch: ExecutionStateUpdate
-    ) -> ExecutionState:
+    def update(self, session_id: str, patch: ExecutionStateUpdate) -> ExecutionState:
         """Apply a partial update to an existing state (or create a new one).
 
         Only non-None fields in ``patch`` are applied.

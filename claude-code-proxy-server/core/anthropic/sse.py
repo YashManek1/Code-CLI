@@ -64,11 +64,14 @@ def _safe_usage_int(value: object) -> int:
 
 def format_sse_event(event_type: str, data: dict) -> str:
     """Format one Anthropic-style SSE event (no logging)."""
-    return f"event: {event_type}\ndata: {json.dumps(
-        data,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )}\n\n"
+    return f"event: {event_type}\ndata: {
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            separators=(',', ':'),
+        )
+    }\n\n"
+
 
 @dataclass
 class ToolCallState:
@@ -531,10 +534,7 @@ class SSEBuilder:
     def close_all_blocks(self) -> Iterator[str]:
         yield from self.close_content_blocks()
         for tool_index, state in list(self.blocks.tool_states.items()):
-            if (
-                state.started
-                and state.block_index >= 0
-            ):
+            if state.started and state.block_index >= 0:
                 yield self.stop_tool_block(tool_index)
 
     # ------------------------------------------------------------------
@@ -568,6 +568,21 @@ class SSEBuilder:
     @property
     def accumulated_reasoning(self) -> str:
         return "".join(self._accumulated_reasoning_parts)
+
+    @property
+    def accumulated_tool_calls(self) -> dict[int, dict]:
+        """Return a dict of index -> {id, name, arguments} for all tools."""
+        res = {}
+        for idx, state in self.blocks.tool_states.items():
+            if not state.started:
+                continue
+            args = state.raw_arg_buffer if self._buffer_tool_calls else "".join(state.contents)
+            res[idx] = {
+                "id": state.tool_id,
+                "name": state.name,
+                "function": {"name": state.name, "arguments": args}
+            }
+        return res
 
     def estimate_output_tokens(self) -> int:
         accumulated_text = self.accumulated_text

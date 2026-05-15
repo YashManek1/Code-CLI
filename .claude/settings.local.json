@@ -1,7 +1,17 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -m pytest tests/api/test_api.py -x -v)"
+      "Bash(python -m pytest tests/api/test_api.py -x -v)",
+      "Bash(pytest tests/ -q --tb=line)",
+      "Bash(python test_import.py)",
+      "Bash(pip install:*)",
+      "Bash(pip show:*)",
+      "Bash(pytest tests/ --collect-only)",
+      "Bash(pytest tests/messaging/test_handler.py -v --tb=short)",
+      "Bash(pytest tests/api/test_app_lifespan_and_errors.py -v --tb=short)",
+      "Bash(pytest tests/api/test_app_lifespan_and_errors.py::test_create_app_general_exception_handler_returns_500 -v --tb=short)",
+      "Bash(pytest tests/api/test_app_lifespan_and_errors.py::test_app_lifespan_messaging_import_error_no_crash -v --tb=short)",
+      "Bash(pytest tests/api/ tests/providers/ tests/config/ -q --tb=line --ignore=tests/api/test_app_lifespan_and_errors.py)"
     ]
   }
 }

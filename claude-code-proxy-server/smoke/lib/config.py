@@ -39,7 +39,7 @@ SECRET_KEY_PARTS = ("KEY", "TOKEN", "SECRET", "WEBHOOK", "AUTH")
 
 PROVIDER_SMOKE_DEFAULT_MODELS: dict[str, str] = {
     "nvidia_nim": "nvidia_nim/z-ai/glm4.7",
-    "open_router": "open_router/stepfun/step-3.5-flash:free",
+    "open_router": "open_router/deepseek/deepseek-r1-0528:free",
     "deepseek": "deepseek/deepseek-v4-pro",
     "lmstudio": "lmstudio/local-model",
     "llamacpp": "llamacpp/local-model",

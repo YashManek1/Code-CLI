@@ -54,6 +54,8 @@ class OpenRouterProvider(AnthropicMessagesTransport):
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
             "anthropic-version": _ANTHROPIC_VERSION,
+            "HTTP-Referer": "https://github.com/Alishahryar1/free-claude-code",
+            "X-Title": "Free Claude Code",
         }
 
     def _model_list_headers(self) -> dict[str, str]:
@@ -78,7 +80,7 @@ class OpenRouterProvider(AnthropicMessagesTransport):
 
     def _new_stream_state(self, request: Any, *, thinking_enabled: bool) -> Any:
         """Create per-stream state for thinking block filtering."""
-        return NativeSseBlockPolicyState()
+        return NativeSseBlockPolicyState(model=str(getattr(request, "model", "") or ""))
 
     def _transform_stream_event(
         self,

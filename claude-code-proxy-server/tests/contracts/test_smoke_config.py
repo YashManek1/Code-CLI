@@ -58,6 +58,20 @@ def test_ollama_provider_configuration_uses_base_url() -> None:
     assert config.provider_models()[0].full_model == "ollama/llama3.1"
 
 
+def test_openrouter_provider_configuration_uses_new_deepseek_default() -> None:
+    config = _smoke_config(
+        settings=_settings(
+            open_router_api_key="openrouter-key",
+            ollama_base_url="",
+        )
+    )
+
+    models = config.provider_smoke_models()
+
+    assert [model.provider for model in models] == ["open_router"]
+    assert models[0].full_model == "open_router/deepseek/deepseek-r1-0528:free"
+
+
 def test_ollama_provider_matrix_filters_models() -> None:
     config = _smoke_config(provider_matrix=frozenset({"ollama"}))
 

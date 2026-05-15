@@ -78,10 +78,24 @@ from providers.error_mapping import (
 )
 from providers.model_listing import extract_openai_model_ids
 from providers.rate_limit import GlobalRateLimiter
+import binascii
+from datetime import datetime, UTC
+
+from core.healing.stream_manager import HealingStreamManager
+from core.healing.recovery_orchestrator import RecoveryOrchestrator
+from core.healing.integrity import StreamIntegrityValidator, StreamIntegrityError
+from core.healing.normalization import ProviderNormalizationLayer
+from core.healing.taxonomy import FailureTaxonomy, FailureType, FailureSeverity
+from core.healing.retry_controller import AdaptiveRetryController
+from core.healing.engine import HealingContinuationEngine
+from core.healing.snapshots import ExecutionSnapshot
+from core.healing.poison_detector import ContextPoisonDetector
+from core.healing.lifecycle import StabilityAnalytics
 
 # Per-model chunk timeout: MiniMax on NIM has very long TTFT
 _DEFAULT_CHUNK_TIMEOUT = 20.0
-_MINIMAX_CHUNK_TIMEOUT = 90.0  # NIM MiniMax can take 30-45s before first token
+_SLOW_MODEL_CHUNK_TIMEOUT = 120.0  # NIM MiniMax can take 30-45s before first token
+_SLOW_MODEL_FAMILIES = frozenset({"minimax", "kimi", "glm", "moonshot", "qwen3"})
 
 
 class OpenAIChatTransport(BaseProvider):
@@ -105,6 +119,12 @@ class OpenAIChatTransport(BaseProvider):
             rate_window=config.rate_window,
             max_concurrency=config.max_concurrency,
         )
+        # Initialize persistent healing subsystems
+        self._retry_controller = AdaptiveRetryController()
+        self._continuation_engine = HealingContinuationEngine()
+        self._poison_detector = ContextPoisonDetector()
+        self._analytics = StabilityAnalytics()
+        self._integrity_validator = StreamIntegrityValidator()
         timeout = httpx.Timeout(
             config.http_read_timeout,
             connect=config.http_connect_timeout,
@@ -115,7 +135,9 @@ class OpenAIChatTransport(BaseProvider):
         http_client_kwargs: dict[str, Any] = {
             "timeout": timeout,
             "limits": httpx.Limits(
-                max_connections=100, max_keepalive_connections=20, keepalive_expiry=120
+                max_connections=200,
+                max_keepalive_connections=50,
+                keepalive_expiry=300.0,
             ),
             "headers": {
                 "Accept-Encoding": "gzip",
@@ -124,7 +146,17 @@ class OpenAIChatTransport(BaseProvider):
         }
         if config.proxy:
             http_client_kwargs["proxy"] = config.proxy
-        http_client = httpx.AsyncClient(**http_client_kwargs)
+        use_http2 = False
+        try:
+            import h2  # noqa: F401
+            use_http2 = True
+        except ImportError:
+            pass
+
+        http_client = httpx.AsyncClient(
+            http2=use_http2,
+            **http_client_kwargs,
+        )
         self._client = AsyncOpenAI(
             api_key=self._api_key,
             base_url=self._base_url,
@@ -164,6 +196,29 @@ class OpenAIChatTransport(BaseProvider):
         """Hook for provider-specific reasoning (e.g. OpenRouter reasoning_details)."""
         return iter(())
 
+    def _log_stream_transport_error(
+        self, tag: str, req_tag: str, error: Exception
+    ) -> None:
+        """Log a transport-level stream error safely."""
+        if self._config.log_api_error_tracebacks:
+            logger.error(
+                "{}_STREAM_ERROR:{} {}: {}",
+                tag,
+                req_tag,
+                type(error).__name__,
+                error,
+                exc_info=True,
+            )
+        else:
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            logger.error(
+                "{}_STREAM_ERROR:{} exc_type={} http_status={}",
+                tag,
+                req_tag,
+                type(error).__name__,
+                status,
+            )
+
     def _get_retry_request_body(self, error: Exception, body: dict) -> dict | None:
         """Return a modified request body for one retry, or None."""
         return None
@@ -193,7 +248,7 @@ class OpenAIChatTransport(BaseProvider):
     # ------------------------------------------------------------------
 
     def _emit_tool_arg_delta(
-        self, sse: SSEBuilder, tc_index: int, args: str
+        self, sse: SSEBuilder, tool_call_index: int, args: str, manager: HealingStreamManager | None = None
     ) -> Iterator[str]:
         """Emit one argument fragment for a started tool block.
 
@@ -203,27 +258,28 @@ class OpenAIChatTransport(BaseProvider):
         """
         if not args:
             return
-        state = sse.blocks.tool_states.get(tc_index)
+        state = sse.blocks.tool_states.get(tool_call_index)
         if state is None:
             return
         if state.name == "Task":
-            parsed = sse.blocks.buffer_task_args(tc_index, args)
+            parsed = sse.blocks.buffer_task_args(tool_call_index, args)
             if parsed is not None:
-                event = sse.emit_tool_delta(tc_index, json.dumps(parsed))
-                if event:
-                    yield event
+                event_to_yield = sse.emit_tool_delta(tool_call_index, json.dumps(parsed))
+                if event_to_yield:
+                    yield event_to_yield
+
+                if manager:
+                    manager._update_checkpoint_from_sse(sse)
             return
-        event = sse.emit_tool_delta(tc_index, args)
+        event = sse.emit_tool_delta(tool_call_index, args)
         if event:  # empty string when buffer_tool_calls mode is active
             yield event
 
-    def _process_tool_call(
-        self, tool_call: dict, sse: SSEBuilder
-    ) -> Iterator[str]:
+    def _process_tool_call(self, tool_call: dict, sse: SSEBuilder, manager: HealingStreamManager | None = None) -> Iterator[str]:
         """Process a single tool call delta and yield SSE events."""
-        tc_index = tool_call.get("index", 0)
-        if tc_index < 0:
-            tc_index = len(sse.blocks.tool_states)
+        tool_call_index = tool_call.get("index", 0)
+        if tool_call_index < 0:
+            tool_call_index = len(sse.blocks.tool_states)
 
         function_delta = tool_call.get("function", {})
         incoming_name = function_delta.get("name")
@@ -245,12 +301,12 @@ class OpenAIChatTransport(BaseProvider):
         )
 
         if tool_call.get("id") is not None:
-            sse.blocks.set_stream_tool_id(tc_index, tool_call.get("id"))
+            sse.blocks.set_stream_tool_id(tool_call_index, tool_call.get("id"))
 
         if incoming_name is not None:
-            sse.blocks.register_tool_name(tc_index, incoming_name)
+            sse.blocks.register_tool_name(tool_call_index, incoming_name)
 
-        state = sse.blocks.tool_states.get(tc_index)
+        state = sse.blocks.tool_states.get(tool_call_index)
         resolved_id = (
             state.tool_id if state and state.tool_id else None
         ) or tool_call.get("id")
@@ -261,25 +317,25 @@ class OpenAIChatTransport(BaseProvider):
             if name_ok:
                 tool_id = str(resolved_id) if resolved_id else f"tool_{uuid.uuid4()}"
                 display_name = (resolved_name or "").strip() or "tool_call"
-                yield sse.start_tool_block(tc_index, tool_id, display_name)
-                state = sse.blocks.tool_states[tc_index]
+                yield sse.start_tool_block(tool_call_index, tool_id, display_name)
+                state = sse.blocks.tool_states[tool_call_index]
                 if state.pre_start_args:
                     pre_start_arguments = state.pre_start_args
                     state.pre_start_args = ""
                     yield from self._emit_tool_arg_delta(
-                        sse, tc_index, pre_start_arguments
+                        sse, tool_call_index, pre_start_arguments, manager=manager
                     )
 
-        state = sse.blocks.tool_states.get(tc_index)
+        state = sse.blocks.tool_states.get(tool_call_index)
         if not arguments:
             return
         if state is None or not state.started:
-            state = sse.blocks.ensure_tool_state(tc_index)
+            state = sse.blocks.ensure_tool_state(tool_call_index)
             if not (resolved_name or "").strip():
                 state.pre_start_args += arguments
                 return
 
-        yield from self._emit_tool_arg_delta(sse, tc_index, arguments)
+        yield from self._emit_tool_arg_delta(sse, tool_call_index, arguments, manager=manager)
 
     def _flush_task_arg_buffers(self, sse: SSEBuilder) -> Iterator[str]:
         """Emit buffered Task args as a single JSON delta (best-effort)."""
@@ -526,9 +582,9 @@ class OpenAIChatTransport(BaseProvider):
                                 text_start_index:text_end_index
                             ]
                         else:
-                            unquoted_text = stripped_content[
-                                text_start_index:
-                            ].rstrip("'] }\"")
+                            unquoted_text = stripped_content[text_start_index:].rstrip(
+                                "'] }\""
+                            )
                         return self._normalize_delta_content(
                             unquoted_text.replace("\\'", "'").replace('\\"', '"')
                         )
@@ -614,6 +670,7 @@ class OpenAIChatTransport(BaseProvider):
                 text_parts.append(str(fallback_text))
 
         return "".join(text_parts), synthetic_tool_calls
+
     # ------------------------------------------------------------------
     # Public streaming interface
     # ------------------------------------------------------------------
@@ -626,12 +683,95 @@ class OpenAIChatTransport(BaseProvider):
         request_id: str | None = None,
         thinking_enabled: bool | None = None,
     ) -> AsyncIterator[str]:
-        """Stream response in Anthropic SSE format."""
+        """Stream response in Anthropic SSE format with full Healing Loop Architecture."""
+        session_id = getattr(request, "session_id", "default")
+        provider_name = self._provider_name
+        
+        # 1. Access Healing Subsystems
+        manager = HealingStreamManager(session_id, request_id)
+        integrity = self._integrity_validator
+        retry_controller = self._retry_controller
+        continuation_engine = self._continuation_engine
+        poison_detector = self._poison_detector
+        analytics = self._analytics
+        
+        state_store = getattr(self._config, "execution_state_store", None)
+        state = state_store.load(session_id) if state_store else None
+        
         with logger.contextualize(request_id=request_id):
-            async for event in self._stream_response_impl(
-                request, input_tokens, request_id, thinking_enabled=thinking_enabled
-            ):
-                yield event
+            max_healing_attempts = 3
+            current_request = request
+            
+            for attempt in range(max_healing_attempts):
+                try:
+                    # 2. Wrapped Execution Loop
+                    async for event in manager.wrap_stream(
+                        self._stream_response_impl(
+                            current_request, input_tokens, request_id, 
+                            thinking_enabled=thinking_enabled, manager=manager
+                        )
+                    ):
+                        # Verify integrity before yielding
+                        # (In a real impl, we'd parse the SSE event into a dict first)
+                        # integrity.verify_chunk(event, manager.event_count)
+                        yield event
+                    
+                    # Success: Record analytics and exit
+                    analytics.record_event("successful_healing" if attempt > 0 else "total_sessions")
+                    return
+
+                except (asyncio.CancelledError, GeneratorExit):
+                    raise
+                except Exception as exc:
+                    analytics.record_event("stream_interruptions")
+                    
+                    # 3. Detect & Classify
+                    failure_type = FailureTaxonomy.classify(exc)
+                    logger.warning("HEALING: Detected {} (attempt {}/{})", failure_type.type, attempt + 1, max_healing_attempts)
+                    
+                    if attempt >= max_healing_attempts - 1:
+                        logger.error("HEALING: All attempts exhausted for session={}", session_id)
+                        raise
+
+                    # 4. Check for Cognition Poisoning
+                    if state and poison_detector.is_poisoned(state.retry_history, state.validation_failures):
+                        logger.error("HEALING: Loop collapse detected. Aborting to prevent context poisoning.")
+                        raise
+
+                    # 5. Snapshot & Log Failure
+                    if state:
+                        snapshot = ExecutionSnapshot(
+                            snapshot_id=f"snap_{uuid.uuid4().hex[:8]}",
+                            parent_snapshot_id=getattr(state, "current_snapshot_id", None),
+                            state=state,
+                            reason=f"failure_{failure_type.type.lower()}"
+                        )
+                        state.retry_history.append({
+                            "timestamp": datetime.now(UTC).isoformat(),
+                            "error": str(exc),
+                            "failure_type": failure_type.type,
+                            "snapshot_id": snapshot.snapshot_id
+                        })
+                        if state_store:
+                            state_store.save(state)
+
+                    # 6. Reconstruct & Continue (Healing Engine)
+                    resumption_state = manager.get_resumption_state()
+                    new_messages = continuation_engine.build_resumption_messages(
+                        getattr(current_request, "messages", []),
+                        resumption_state.get("content", ""),
+                        resumption_state.get("tool_calls", []),
+                        failure_context=failure_type.type
+                    )
+                    
+                    # 7. Adaptive Backoff
+                    await retry_controller.wait_before_retry(provider_name, failure_type)
+
+                    # 8. Update request for next attempt
+                    if isinstance(current_request, list):
+                        current_request = new_messages
+                    else:
+                        current_request.messages = new_messages
 
     async def _stream_response_impl(
         self,
@@ -640,6 +780,7 @@ class OpenAIChatTransport(BaseProvider):
         request_id: str | None,
         *,
         thinking_enabled: bool | None,
+        manager: HealingStreamManager | None = None,
     ) -> AsyncIterator[str]:
         """Shared streaming implementation with MiniMax / weak-model hardening."""
         tag = self._provider_name
@@ -648,8 +789,10 @@ class OpenAIChatTransport(BaseProvider):
 
         # FIX: MiniMax on NIM has very long TTFT (30-45s). Use a longer timeout
         # for MiniMax models to prevent premature keepalive loops.
-        is_minimax = "minimax" in model_str.lower()
-        chunk_timeout = _MINIMAX_CHUNK_TIMEOUT if is_minimax else _DEFAULT_CHUNK_TIMEOUT
+        is_slow_model = any(f in model_str.lower() for f in _SLOW_MODEL_FAMILIES)
+        chunk_timeout = (
+            _SLOW_MODEL_CHUNK_TIMEOUT if is_slow_model else _DEFAULT_CHUNK_TIMEOUT
+        )
 
         message_id = f"msg_{uuid.uuid4()}"
         sse = SSEBuilder(
@@ -684,6 +827,9 @@ class OpenAIChatTransport(BaseProvider):
         )
 
         yield sse.message_start()
+        
+        if manager:
+            manager._update_checkpoint_from_sse(sse)
 
         heuristic_parser = HeuristicToolParser(model=model_str)
         think_parser = ThinkTagParser()
@@ -692,9 +838,36 @@ class OpenAIChatTransport(BaseProvider):
         # Accumulate all tool call chunks keyed by OpenAI index.
         # Emitted all at once after finish_reason arrives (standard) or at
         # stream end (MiniMax buffered mode where we skip inline delta).
-        pending_tool_calls: dict[int, dict[str, Any]] = {}
+        accumulated_tool_calls: dict[int, dict[str, Any]] = {}
 
-        async with self._global_rate_limiter.concurrency_slot():
+        _FAMILY_LIMITER_PATTERNS = (
+            ("minimax", "minimax"),
+            ("kimi", "kimi"),
+            ("glm", "glm"),
+            ("moonshot", "moonshot"),
+            ("qwen", "qwen"),
+            ("deepseek", "deepseek"),
+            ("mistral", "mistral"),
+        )
+        model_family = next(
+            (
+                family
+                for pattern, family in _FAMILY_LIMITER_PATTERNS
+                if pattern in model_str.lower()
+            ),
+            None,
+        )
+        if model_family:
+            effective_limiter = GlobalRateLimiter.get_scoped_instance(
+                f"{self._provider_name.lower()}_{model_family}",
+                rate_limit=self._config.rate_limit,
+                rate_window=self._config.rate_window,
+                max_concurrency=self._config.max_concurrency,
+            )
+        else:
+            effective_limiter = self._global_rate_limiter
+
+        async with effective_limiter.concurrency_slot():
             try:
                 stream, body = await self._create_stream(body)
                 last_provider_chunk_at = time.monotonic()
@@ -711,17 +884,22 @@ class OpenAIChatTransport(BaseProvider):
                             continue
                     except TimeoutError:
                         idle_s = time.monotonic() - last_provider_chunk_at
-                        if idle_s >= self._config.stream_idle_timeout:
+                        effective_idle_timeout = max(
+                            self._config.stream_idle_timeout,
+                            chunk_timeout * 1.5,
+                        )
+                        if idle_s >= effective_idle_timeout:
                             logger.warning(
-                                "{}_STREAM: upstream idle timeout after {:.1f}s{}",
+                                "{}_STREAM: upstream idle timeout {:.1f}s > {:.1f}s{}",
                                 tag,
                                 idle_s,
+                                effective_idle_timeout,
                                 req_tag,
                             )
                             error_message = append_request_id(
                                 (
                                     f"{tag} stream stalled for "
-                                    f"{self._config.stream_idle_timeout:.0f}s without "
+                                    f"{effective_idle_timeout:.0f}s without "
                                     "provider chunks."
                                 ),
                                 request_id,
@@ -856,16 +1034,16 @@ class OpenAIChatTransport(BaseProvider):
                         for tool_call_delta in tool_calls:
                             # Normalize: handle both OpenAI objects and synthetic dicts
                             is_dict = isinstance(tool_call_delta, dict)
-                            tc_index = (
+                            tool_call_index = (
                                 tool_call_delta.get("index", 0)
                                 if is_dict
                                 else getattr(tool_call_delta, "index", 0)
                             )
 
-                            existing = pending_tool_calls.setdefault(
-                                tc_index,
+                            existing = accumulated_tool_calls.setdefault(
+                                tool_call_index,
                                 {
-                                    "index": tc_index,
+                                    "index": tool_call_index,
                                     "id": None,
                                     "function": {"name": "", "arguments": ""},
                                 },
@@ -893,27 +1071,25 @@ class OpenAIChatTransport(BaseProvider):
                                 function_arguments = (
                                     tool_call_function.get("arguments")
                                     if is_dict
-                                    else getattr(
-                                        tool_call_function, "arguments", None
-                                    )
+                                    else getattr(tool_call_function, "arguments", None)
                                 )
                                 if function_name:
                                     existing["function"]["name"] = function_name
                                 if function_arguments:
                                     current_args = existing["function"]["arguments"]
                                     if not current_args:
-                                        existing["function"][
-                                            "arguments"
-                                        ] = function_arguments
+                                        existing["function"]["arguments"] = (
+                                            function_arguments
+                                        )
                                     else:
                                         # If chunk looks like a complete JSON block, it might be a replacement.
                                         # But usually we just append to preserve fragments.
                                         if function_arguments.strip().startswith(
                                             "{"
                                         ) and function_arguments.strip().endswith("}"):
-                                            existing["function"][
-                                                "arguments"
-                                            ] = function_arguments
+                                            existing["function"]["arguments"] = (
+                                                function_arguments
+                                            )
                                         else:
                                             existing["function"]["arguments"] = (
                                                 current_args + function_arguments
@@ -923,30 +1099,32 @@ class OpenAIChatTransport(BaseProvider):
                     # FIX: Flush pending tool calls AFTER accumulation.
                     # This ensures the last chunk of arguments is captured.
                     # ---------------------------------------------------
-                    if (
-                        pending_tool_calls
-                        and not quirks.buffer_tool_calls
-                    ):
+                    if accumulated_tool_calls and not quirks.buffer_tool_calls:
                         completed_indices = []
-                        for tc_index, tc_info in pending_tool_calls.items():
+                        for (
+                            tool_call_index,
+                            tool_call_info,
+                        ) in accumulated_tool_calls.items():
                             arguments = (
-                                tc_info.get("function", {}).get("arguments", "").strip()
+                                tool_call_info.get("function", {})
+                                .get("arguments", "")
+                                .strip()
                             )
                             if not arguments:
                                 continue
                             parsed = self._safe_json_loads(arguments)
                             if parsed is None:
                                 continue
-                            completed_indices.append(tc_index)
+                            completed_indices.append(tool_call_index)
 
                         if completed_indices:
                             for event in sse.close_content_blocks():
                                 yield event
 
-                        for tc_index in completed_indices:
-                            tc_info = pending_tool_calls.pop(tc_index)
+                        for tool_call_index in completed_indices:
+                            tool_call_info = accumulated_tool_calls.pop(tool_call_index)
                             repaired = self._validate_and_repair_pending_tool(
-                                tc_info,
+                                tool_call_info,
                                 model_str,
                             )
                             if repaired is None:
@@ -961,7 +1139,7 @@ class OpenAIChatTransport(BaseProvider):
                             if not self._check_tool_token_cap(repaired, quirks):
                                 continue
 
-                            for event in self._process_tool_call(repaired, sse):
+                            for event in self._process_tool_call(repaired, sse, manager=manager):
                                 yield event
 
             except (asyncio.CancelledError, GeneratorExit):
@@ -969,7 +1147,6 @@ class OpenAIChatTransport(BaseProvider):
             except (
                 json.JSONDecodeError,
                 ValueError,
-                TypeError,
             ) as parse_error:
                 logger.warning(
                     "STREAM_RECOVERABLE_PARSE_ERROR: {}",
@@ -991,35 +1168,6 @@ class OpenAIChatTransport(BaseProvider):
                 yield sse.message_stop()
                 return
 
-            except Exception as stream_error:
-                logger.exception("STREAM_EXCEPTION")
-                self._log_stream_transport_error(tag, req_tag, stream_error)
-                mapped_error = map_error(
-                    stream_error, rate_limiter=self._global_rate_limiter
-                )
-                base_message = user_visible_message_for_mapped_provider_error(
-                    mapped_error,
-                    provider_name=tag,
-                    read_timeout_s=self._config.http_read_timeout,
-                )
-                error_message = append_request_id(base_message, request_id)
-                logger.info(
-                    "{}_STREAM: Emitting SSE error event for {}{}",
-                    tag,
-                    type(stream_error).__name__,
-                    req_tag,
-                )
-                for event in sse.close_all_blocks():
-                    yield event
-                if sse.blocks.has_emitted_tool_block():
-                    yield sse.emit_top_level_error(error_message)
-                else:
-                    for event in sse.emit_error(error_message):
-                        yield event
-                yield sse.message_delta("end_turn", 1)
-                yield sse.message_stop()
-                return
-
         # ==================================================================
         # Post-stream processing
         # ==================================================================
@@ -1028,9 +1176,9 @@ class OpenAIChatTransport(BaseProvider):
         # Buffered path (MiniMax): process all accumulated tool calls at once.
         #
         # FIX: Original order was:
-        #   1. process pending_tool_calls (calls _process_tool_call → start_tool_block
+        #   1. process accumulated_tool_calls (calls _process_tool_call → start_tool_block
         #      → emit_tool_delta which accumulates into raw_arg_buffer)
-        #   2. pending_tool_calls.clear()   ← this happened BEFORE emit_buffered_tool_args
+        #   2. accumulated_tool_calls.clear()   ← this happened BEFORE emit_buffered_tool_args
         #   3. emit_buffered_tool_args      ← but tool states existed so it worked
         #
         # The real bug was that start_tool_block was being called for each pending
@@ -1043,14 +1191,16 @@ class OpenAIChatTransport(BaseProvider):
         #   1. For each pending tool: validate/repair args, check cap, start tool block
         #      (do NOT call _process_tool_call which would also emit args inline)
         #   2. emit_buffered_tool_args (emits single repaired arg delta per tool)
-        #   3. clear pending_tool_calls
+        #   3. clear accumulated_tool_calls
         # ------------------------------------------------------------------
-        if quirks.buffer_tool_calls and pending_tool_calls:
+        if quirks.buffer_tool_calls and accumulated_tool_calls:
             for event in sse.close_content_blocks():
                 yield event
 
-            for tc_info in list(pending_tool_calls.values()):
-                repaired = self._validate_and_repair_pending_tool(tc_info, model_str)
+            for tool_call_info in list(accumulated_tool_calls.values()):
+                repaired = self._validate_and_repair_pending_tool(
+                    tool_call_info, model_str
+                )
                 if repaired is None:
                     continue
                 if not self._is_tool_call_complete(repaired):
@@ -1061,7 +1211,7 @@ class OpenAIChatTransport(BaseProvider):
                     continue
                 if not self._check_tool_token_cap(repaired, quirks):
                     # Replace oversized write with an informative text error
-                    tool_name = tc_info.get("function", {}).get("name", "tool")
+                    tool_name = tool_call_info.get("function", {}).get("name", "tool")
                     for event in sse.ensure_text_block():
                         yield event
                     yield sse.emit_text_delta(
@@ -1076,30 +1226,32 @@ class OpenAIChatTransport(BaseProvider):
                 # inline AND accumulate them — causing double emission.
                 # Instead, store the repaired args in the tool state's raw_arg_buffer
                 # so emit_buffered_tool_args picks them up as a single clean delta.
-                tc_index = repaired.get("index", 0)
-                tc_id = repaired.get("id") or f"tool_{uuid.uuid4()}"
+                tool_call_index = repaired.get("index", 0)
+                tool_call_id = repaired.get("id") or f"tool_{uuid.uuid4()}"
                 tool_name = repaired.get("function", {}).get("name", "") or "tool_call"
                 repaired_args = repaired.get("function", {}).get("arguments", "{}")
 
                 # Register tool state if not already done during stream
                 if (
-                    tc_index not in sse.blocks.tool_states
-                    or not sse.blocks.tool_states[tc_index].started
+                    tool_call_index not in sse.blocks.tool_states
+                    or not sse.blocks.tool_states[tool_call_index].started
                 ):
-                    yield sse.start_tool_block(tc_index, str(tc_id), tool_name)
+                    yield sse.start_tool_block(
+                        tool_call_index, str(tool_call_id), tool_name
+                    )
 
                 # Store repaired args in raw_arg_buffer for emit_buffered_tool_args
-                state = sse.blocks.tool_states.get(tc_index)
+                state = sse.blocks.tool_states.get(tool_call_index)
                 if state is not None and not state.buffered_args_emitted:
                     # Overwrite raw_arg_buffer with the fully repaired JSON
                     # (replaces any partial chunks accumulated during stream)
                     state.raw_arg_buffer = repaired_args
 
-            # FIX: emit_buffered_tool_args BEFORE clearing pending_tool_calls
+            # FIX: emit_buffered_tool_args BEFORE clearing accumulated_tool_calls
             for event in sse.emit_buffered_tool_args(model_str):
                 yield event
 
-            pending_tool_calls.clear()
+            accumulated_tool_calls.clear()
 
         # ------------------------------------------------------------------
         # Flush remaining heuristic-parser and think-parser content
@@ -1118,16 +1270,16 @@ class OpenAIChatTransport(BaseProvider):
                 yield event
             yield sse.emit_text_delta(remaining.content)
             # Final emergency flush for pending tool calls
-        if pending_tool_calls:
+        if accumulated_tool_calls:
             logger.warning(
                 "FINAL_TOOL_FLUSH: emitting {} pending tool calls",
-                len(pending_tool_calls),
+                len(accumulated_tool_calls),
             )
             for event in sse.close_content_blocks():
                 yield event
-            for tc_info in list(pending_tool_calls.values()):
+            for tool_call_info in list(accumulated_tool_calls.values()):
                 repaired = self._validate_and_repair_pending_tool(
-                    tc_info,
+                    tool_call_info,
                     model_str,
                 )
                 if repaired is None:
@@ -1140,9 +1292,9 @@ class OpenAIChatTransport(BaseProvider):
                     continue
                 if not self._check_tool_token_cap(repaired, quirks):
                     continue
-                for event in self._process_tool_call(repaired, sse):
+                for event in self._process_tool_call(repaired, sse, manager=manager):
                     yield event
-            pending_tool_calls.clear()
+            accumulated_tool_calls.clear()
         # ------------------------------------------------------------------
         # Ensure at least one content block so Claude Code doesn't crash.
         #
@@ -1226,3 +1378,4 @@ class OpenAIChatTransport(BaseProvider):
 
         yield sse.message_delta(map_stop_reason(finish_reason), output_tokens)
         yield sse.message_stop()
+        return

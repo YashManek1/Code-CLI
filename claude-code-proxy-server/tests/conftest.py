@@ -20,12 +20,11 @@ os.environ["ANTHROPIC_AUTH_TOKEN"] = ""
 Settings.model_config = {**Settings.model_config, "env_file": None}
 
 
-@pytest.fixture(autouse=True)
-def _isolate_from_dotenv(monkeypatch):
-    """Prevent Pydantic BaseSettings from reading the .env file during tests."""
-    monkeypatch.setattr(
-        Settings, "model_config", {**Settings.model_config, "env_file": None}
-    )
+@pytest.fixture
+def settings():
+    """Return a properly initialized Settings object for testing."""
+    # Ensure we don't load any .env files for tests by default
+    return Settings(_env_file=None)
 
 
 @pytest.fixture

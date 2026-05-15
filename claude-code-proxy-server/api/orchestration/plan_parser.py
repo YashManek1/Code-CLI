@@ -18,12 +18,8 @@ from typing import Literal
 from ..models.execution_state import PlanStep
 
 # Patterns for plan step extraction
-_CHECKBOX_PATTERN = re.compile(
-    r"^\s*[-*]\s*\[([ xX/])\]\s*(.+)$", re.MULTILINE
-)
-_NUMBERED_PATTERN = re.compile(
-    r"^\s*(\d+)[.)]\s+(.+)$", re.MULTILINE
-)
+_CHECKBOX_PATTERN = re.compile(r"^\s*[-*]\s*\[([ xX/])\]\s*(.+)$", re.MULTILINE)
+_NUMBERED_PATTERN = re.compile(r"^\s*(\d+)[.)]\s+(.+)$", re.MULTILINE)
 _BULLET_PATTERN = re.compile(
     r"^\s*[-*]\s+(.+)$",
     re.MULTILINE,

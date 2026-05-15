@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,6 +40,7 @@ class NativeSseBlockPolicyState:
     dropped_indexes: set[int] = field(default_factory=set)
     pending_suppressed_stops: set[int] = field(default_factory=set)
     message_stopped: bool = False
+    model: str | None = None
 
 
 def format_native_sse_event(event_name: str | None, data_text: str) -> str:
@@ -99,9 +101,11 @@ def _synthetic_start_content_block(
             inp = stored_tool_block.get("input")
             return {
                 "type": "tool_use",
-                "id": tool_id
-                if isinstance(tool_id, str) and tool_id
-                else f"toolu_or_{upstream_index}",
+                "id": (
+                    tool_id
+                    if isinstance(tool_id, str) and tool_id
+                    else f"toolu_or_{upstream_index}"
+                ),
                 "name": name if isinstance(name, str) else "",
                 "input": inp if isinstance(inp, dict) else {},
             }
@@ -116,6 +120,34 @@ def _synthetic_start_content_block(
     if block_kind == "text":
         return {"type": "text", "text": ""}
     return {"type": "text", "text": ""}
+
+
+def _ensure_message_start_payload(
+    payload: dict[str, Any],
+    state: NativeSseBlockPolicyState,
+) -> None:
+    """Ensure message_start has a message object with a model string."""
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        message = {}
+        payload["message"] = message
+
+    if not message.get("id"):
+        message["id"] = f"msg_{uuid.uuid4().hex}"
+    message.setdefault("type", "message")
+    message.setdefault("role", "assistant")
+    message.setdefault("content", [])
+    if not message.get("model"):
+        fallback_model = state.model or "unknown"
+        message["model"] = fallback_model
+    message.setdefault("stop_reason", None)
+    message.setdefault("stop_sequence", None)
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        message["usage"] = {"input_tokens": 0, "output_tokens": 1}
+    else:
+        usage.setdefault("input_tokens", 0)
+        usage.setdefault("output_tokens", 1)
 
 
 def _should_drop_block_type(block_type: Any, *, thinking_enabled: bool) -> bool:
@@ -184,6 +216,10 @@ def transform_native_sse_block_event(
         payload = json.loads(data_text)
     except json.JSONDecodeError:
         return event
+
+    if event_name == "message_start":
+        _ensure_message_start_payload(payload, state)
+        return format_native_sse_event(event_name, json.dumps(payload))
 
     if event_name == "content_block_start":
         block = payload.get("content_block")

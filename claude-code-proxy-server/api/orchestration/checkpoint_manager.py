@@ -63,9 +63,7 @@ class CheckpointManager:
         )
         return updated
 
-    def restore_checkpoint(
-        self, session_id: str
-    ) -> ExecutionState | None:
+    def restore_checkpoint(self, session_id: str) -> ExecutionState | None:
         """Restore the active checkpoint: set the implementation phase
         to the checkpoint's phase and return the state.
 
@@ -73,9 +71,7 @@ class CheckpointManager:
         """
         state = self._store.load(session_id)
         if state is None or state.current_checkpoint is None:
-            logger.info(
-                "CHECKPOINT_RESTORE: no checkpoint for session={}", session_id
-            )
+            logger.info("CHECKPOINT_RESTORE: no checkpoint for session={}", session_id)
             return None
 
         checkpoint_phase = state.current_checkpoint.phase
@@ -92,17 +88,13 @@ class CheckpointManager:
         )
         return updated
 
-    def advance_phase(
-        self, session_id: str, phase: ExecutionPhase
-    ) -> ExecutionState:
+    def advance_phase(self, session_id: str, phase: ExecutionPhase) -> ExecutionState:
         """Set the implementation phase for a session."""
         updated = self._store.update(
             session_id,
             ExecutionStateUpdate(implementation_phase=phase),
         )
-        logger.info(
-            "PHASE_ADVANCE: session={} phase={}", session_id, phase
-        )
+        logger.info("PHASE_ADVANCE: session={} phase={}", session_id, phase)
         return updated
 
     def get_current_phase(self, session_id: str) -> ExecutionPhase:

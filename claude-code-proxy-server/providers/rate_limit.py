@@ -264,6 +264,30 @@ class GlobalRateLimiter:
                 )
                 self.set_blocked(delay)
                 await asyncio.sleep(delay)
+            except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
+                last_exc = e
+                status_code = getattr(getattr(e, "response", None), "status_code", 0)
+                
+                # Only retry on 5xx or timeouts/connection errors
+                if isinstance(e, httpx.HTTPStatusError) and status_code < 500:
+                    raise
+
+                if attempt >= max_retries:
+                    logger.warning(
+                        f"Retry exhausted for {type(e).__name__} (status={status_code}) "
+                        f"after {max_retries} retries. Blocking provider for 30s."
+                    )
+                    self.set_blocked(30) # Circuit breaker
+                    break
+
+                delay = min(base_delay * (2**attempt), max_delay)
+                delay += random.uniform(0, jitter)
+                logger.warning(
+                    f"Upstream error ({type(e).__name__} status={status_code}), "
+                    f"attempt {attempt + 1}/{max_retries + 1}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
 
         assert last_exc is not None
         raise last_exc

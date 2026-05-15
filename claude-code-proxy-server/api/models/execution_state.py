@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, Any
 
 from pydantic import BaseModel, Field
 
@@ -80,6 +80,9 @@ class ExecutionState(BaseModel):
     architecture_sources: list[str] = Field(default_factory=list)
     validation_findings: list[str] = Field(default_factory=list)
     processed_tool_result_ids: list[str] = Field(default_factory=list)
+    pending_subtasks: list[str] = Field(default_factory=list)
+    retry_history: list[dict[str, Any]] = Field(default_factory=list)
+    validation_failures: list[dict[str, Any]] = Field(default_factory=list)
     last_updated: datetime = Field(default_factory=lambda: datetime.now(UTC))
     version: int = 1
 
@@ -118,3 +121,6 @@ class ExecutionStateUpdate(BaseModel):
     architecture_sources: list[str] | None = None
     validation_findings: list[str] | None = None
     processed_tool_result_ids: list[str] | None = None
+    pending_subtasks: list[str] | None = None
+    retry_history: list[dict[str, Any]] | None = None
+    validation_failures: list[dict[str, Any]] | None = None

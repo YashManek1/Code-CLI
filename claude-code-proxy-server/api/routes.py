@@ -184,6 +184,7 @@ _FORWARDED_HEADER_NAMES = frozenset(
     }
 )
 
+
 @router.post("/v1/messages")
 async def create_message(
     request: Request,
@@ -269,7 +270,7 @@ async def bootstrap_legacy():
 @router.get("/api/claude_code_penguin_mode")
 async def penguin_mode():
     """Fast mode availability for Claude Code (penguin mode)."""
-    return {"enabled": False, "disabled_reason": "preference"}
+    return {"enabled": True}
 
 
 @router.api_route("/api/claude_code_penguin_mode", methods=["HEAD", "OPTIONS"])
@@ -317,7 +318,13 @@ def _get_execution_state_store(request: Request) -> ExecutionStateStore:
     """Retrieve the execution state store from app state."""
     store = getattr(request.app.state, "execution_state_store", None)
     if store is None:
-        raise HTTPException(status_code=503, detail="Execution state store not initialized")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Execution state orchestration is disabled. "
+                "Set ENABLE_EXECUTION_STATE_ORCHESTRATION=true in .env and restart."
+            ),
+        )
     return store
 
 
@@ -373,7 +380,9 @@ async def complete_step(
             break
 
     if target_step is None:
-        raise HTTPException(status_code=404, detail=f"Step {step_id} not found in remaining steps")
+        raise HTTPException(
+            status_code=404, detail=f"Step {step_id} not found in remaining steps"
+        )
 
     updated = store.append_completed_step(session_id, target_step)
     if updated is None:
@@ -396,7 +405,12 @@ async def set_checkpoint(
     phase_str = body.get("phase")
 
     state = store.ensure_state(session_id)
-    phase = ExecutionPhase(phase_str) if phase_str else state.implementation_phase
+    phase_normalized = phase_str.lower().replace("-", "_") if phase_str else None
+    phase = (
+        ExecutionPhase(phase_normalized)
+        if phase_normalized
+        else state.implementation_phase
+    )
 
     checkpoint = CheckpointState(
         name=name,
@@ -406,9 +420,7 @@ async def set_checkpoint(
     updated = store.update(
         session_id, ExecutionStateUpdate(current_checkpoint=checkpoint)
     )
-    logger.info(
-        "CHECKPOINT_SET: session={} name={} phase={}", session_id, name, phase
-    )
+    logger.info("CHECKPOINT_SET: session={} name={} phase={}", session_id, name, phase)
     return {"status": "checkpoint_set", **updated.model_dump(mode="json")}
 
 
@@ -421,11 +433,13 @@ async def restore_checkpoint(
     """Restore the active checkpoint for a session."""
     store = _get_execution_state_store(request)
     from .orchestration.checkpoint_manager import CheckpointManager
+
     manager = CheckpointManager(store)
     updated = manager.restore_checkpoint(session_id)
     if updated is None:
         raise HTTPException(status_code=404, detail="No checkpoint found to restore")
     return {"status": "checkpoint_restored", **updated.model_dump(mode="json")}
+
 
 @router.post("/v1/execution_state/{session_id}/apply_plan")
 async def apply_plan(
@@ -467,6 +481,7 @@ async def apply_plan(
         "status": "plan_applied",
         **updated.model_dump(mode="json"),
     }
+
 
 @router.delete("/v1/execution_state/{session_id}")
 async def delete_execution_state(

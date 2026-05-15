@@ -59,7 +59,7 @@ function getExecutionStateBaseUrl(): string | null {
 
 export function isExecutionStateOrchestrationEnabled(): boolean {
 	const value = process.env.CLAUDE_CODE_ENABLE_EXECUTION_STATE_ORCHESTRATION
-	if (!value) return false
+	if (!value) return true
 	return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase())
 }
 

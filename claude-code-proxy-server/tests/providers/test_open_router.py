@@ -212,6 +212,53 @@ def test_build_request_body_default_max_tokens(open_router_provider):
     assert body["max_tokens"] == OPENROUTER_DEFAULT_MAX_TOKENS
 
 
+def test_build_request_body_caps_deepseek_r1_max_tokens(open_router_provider):
+    req = MockRequest(model="deepseek/deepseek-r1", max_tokens=64000)
+
+    body = open_router_provider._build_request_body(req)
+
+    assert body["max_tokens"] == 16000
+
+
+def test_build_request_body_caps_deepseek_r1_0528_max_tokens(open_router_provider):
+    req = MockRequest(model="deepseek/deepseek-r1-0528:free", max_tokens=200000)
+
+    body = open_router_provider._build_request_body(req)
+
+    assert body["max_tokens"] == 163840
+
+
+def test_build_request_body_strips_incompatible_fields_for_deepseek_r1_free(
+    open_router_provider,
+):
+    req = MockRequest(
+        model="deepseek/deepseek-r1-0528:free",
+        tools=[{"name": "Agent", "input_schema": {"type": "object"}}],
+        tool_choice={"type": "any"},
+        mcp_servers=[{"url": "https://example.invalid/mcp"}],
+    )
+
+    body = open_router_provider._build_request_body(req)
+
+    assert "mcp_servers" not in body
+    assert "reasoning" not in body
+    assert "tools" not in body
+    assert "tool_choice" not in body
+
+
+def test_build_request_body_keeps_tools_for_non_free_deepseek_r1(open_router_provider):
+    req = MockRequest(
+        model="deepseek/deepseek-r1",
+        tools=[{"name": "Agent", "input_schema": {"type": "object"}}],
+        tool_choice={"type": "any"},
+    )
+
+    body = open_router_provider._build_request_body(req)
+
+    assert body["tools"]
+    assert body["tool_choice"] == {"type": "any"}
+
+
 def test_build_request_body_strips_unsigned_thinking_history(open_router_provider):
     req = MockRequest(
         messages=[
@@ -564,9 +611,9 @@ async def test_stream_response_reopens_interleaved_thinking_after_text(
         if p.event == "content_block_start"
         and p.data.get("content_block", {}).get("type") == "thinking"
     ]
-    assert len(think_starts) == 2, (
-        "reopened thinking must have its own `content_block_start`"
-    )
+    assert (
+        len(think_starts) == 2
+    ), "reopened thinking must have its own `content_block_start`"
 
 
 @pytest.mark.asyncio

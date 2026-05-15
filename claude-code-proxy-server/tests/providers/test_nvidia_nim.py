@@ -469,10 +469,7 @@ async def test_stream_response_retries_without_reasoning_budget(nim_provider):
     assert mock_create.await_count == 2
     first_call = mock_create.await_args_list[0].kwargs
     second_call = mock_create.await_args_list[1].kwargs
-    assert (
-        first_call["extra_body"]["chat_template_kwargs"]["reasoning_budget"]
-        == 100
-    )
+    assert first_call["extra_body"]["chat_template_kwargs"]["reasoning_budget"] == 100
     assert "reasoning_budget" not in second_call["extra_body"]
     assert "reasoning_budget" not in second_call["extra_body"]["chat_template_kwargs"]
     assert second_call["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True

@@ -93,7 +93,9 @@ def get_token_count(
                         blob = block
                     try:
                         total_tokens += len(
-                            ENCODER.encode(json.dumps(blob, default=str, ensure_ascii=False))
+                            ENCODER.encode(
+                                json.dumps(blob, default=str, ensure_ascii=False)
+                            )
                         )
                     except (TypeError, ValueError, OverflowError) as e:
                         logger.debug(

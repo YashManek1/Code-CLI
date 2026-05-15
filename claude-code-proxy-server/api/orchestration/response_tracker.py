@@ -21,9 +21,7 @@ class ResponseTracker:
         self._store = store
         self._tracker = ExecutionTracker(store)
 
-    def process_request_messages(
-        self, session_id: str, messages: list[Any]
-    ) -> None:
+    def process_request_messages(self, session_id: str, messages: list[Any]) -> None:
         """Scan incoming messages for tool results and update steps."""
         if not messages:
             return
@@ -58,11 +56,11 @@ class ResponseTracker:
                     )
                     continue
 
-                # Very basic auto-tracker: mark the active step as completed
+                # Very basic auto-tracker: mark the active step as in_progress
                 # if a tool result successfully returns. In a full implementation,
                 # we would map the tool_use_id back to the assistant's action.
                 active_step = self._tracker.get_next_step(session_id)
-                if active_step:
+                if active_step and active_step.status == "pending":
                     logger.info(
                         "AUTO_TRACK: marking step_id={} as completed due to successful tool_result",
                         active_step.step_id,

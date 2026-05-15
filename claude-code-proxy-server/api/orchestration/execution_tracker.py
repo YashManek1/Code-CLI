@@ -109,9 +109,7 @@ class ExecutionTracker:
 
         parsed_steps = normalize_plan(parsed_steps)
 
-        completed_steps, remaining_steps = split_by_status(
-            parsed_steps
-        )
+        completed_steps, remaining_steps = split_by_status(parsed_steps)
 
         state.approved_plan = plan_text
         state.completed_steps = completed_steps

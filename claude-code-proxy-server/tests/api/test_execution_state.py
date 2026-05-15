@@ -212,7 +212,9 @@ class TestExecutionStateStore:
         loaded = temp_store.load("new-session")
         assert loaded is not None
 
-    def test_ensure_state_from_parent_clones_plan(self, temp_store: ExecutionStateStore):
+    def test_ensure_state_from_parent_clones_plan(
+        self, temp_store: ExecutionStateStore
+    ):
         parent = ExecutionState(
             session_id="plan-session",
             approved_plan="# Plan\n- [ ] Build it",

@@ -100,7 +100,9 @@ async def test_dedupe_joiner_receives_live_events_before_primary_finishes():
 
     first = asyncio.create_task(consume_all("req_first"))
     await first_event_started.wait()
-    second_events = await asyncio.wait_for(consume_first_event("req_second"), timeout=0.2)
+    second_events = await asyncio.wait_for(
+        consume_first_event("req_second"), timeout=0.2
+    )
     release_stop.set()
     first_events = await first
 

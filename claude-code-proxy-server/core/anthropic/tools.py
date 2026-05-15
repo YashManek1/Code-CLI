@@ -80,11 +80,23 @@ _QUIRK_PATTERNS: list[tuple[str, ModelQuirks]] = [
         ),
     ),
     (
+        "glm",  # z-ai/glm-4.7, z-ai/glm5, z-ai/glm-5.1, THUDM/glm-4
+        ModelQuirks(
+            requires_json_repair=True,
+            flatten_tool_schemas=True,
+            max_schema_depth=4,
+            buffer_tool_calls=True,  # GLM streams partial JSON like MiniMax
+            max_tool_tokens=64_000,
+            strip_think_tags=True,
+        ),
+    ),
+    (
         "kimi",  # matches Moonshot AI's Kimi models (NIM or OpenRouter)
         ModelQuirks(
             requires_json_repair=True,
             flatten_tool_schemas=True,
-            buffer_tool_calls=False,
+            max_schema_depth=4,
+            buffer_tool_calls=True,
             max_tool_tokens=64_000,
             strip_think_tags=True,
         ),
@@ -264,12 +276,12 @@ def repair_tool_arguments(raw: str, *, tool_name: str = "", model: str = "") -> 
         return json.dumps(harvested, ensure_ascii=False)
 
     logger.error(
-        "JSON_REPAIR: all strategies failed for '{}' args (model={}), using {{}}. raw_prefix={}",
+        "JSON_REPAIR: all strategies failed for '{}' args (model={}), raising error. raw_prefix={}",
         tool_name or "?",
         model or "?",
         raw[:200],
     )
-    return "{}"
+    raise ValueError(f"Could not repair tool arguments for {tool_name or 'unknown'}")
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,115 @@
+{
+  "input": [
+    "Go through entire proxy-server make a proper plan to test stabilization, integration,streaming,etc every little details every outcome should be properly tested make a proper plan for it"
+  ],
+  "output": [
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "message_start",
+        "message": {
+          "id": "msg_6e837f4d-4c3b-4ac2-aed5-cee05d287619",
+          "type": "message",
+          "role": "assistant",
+          "content": [],
+          "model": "deepseek/deepseek-r1-0528",
+          "stop_reason": null,
+          "stop_sequence": null,
+          "usage": {
+            "input_tokens": 19666,
+            "output_tokens": 1
+          }
+        }
+      },
+      "ttftMs": 146
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+          "type": "text",
+          "text": ""
+        }
+      }
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+          "type": "text_delta",
+          "text": "Provider API request failed. (request_id=req_2c34af6d2850)"
+        }
+      }
+    },
+    {
+      "uuid": "UUID-3",
+      "requestId": "REQUEST_ID",
+      "timestamp": "2026-05-14T20:06:08.853Z",
+      "message": {
+        "id": "msg_6e837f4d-4c3b-4ac2-aed5-cee05d287619",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Provider API request failed. (request_id=req_2c34af6d2850)",
+            "citations": []
+          }
+        ],
+        "model": "deepseek/deepseek-r1-0528",
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 19666,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 1,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        }
+      },
+      "type": "assistant"
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_stop",
+        "index": 0
+      }
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "message_delta",
+        "delta": {
+          "stop_reason": "end_turn",
+          "stop_sequence": null
+        },
+        "usage": {
+          "input_tokens": 19666,
+          "output_tokens": 1
+        }
+      }
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "message_stop"
+      }
+    }
+  ]
+}
